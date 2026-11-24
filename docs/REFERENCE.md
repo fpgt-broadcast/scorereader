@@ -7,6 +7,7 @@ The details behind the [README](../README.md): outputs, settings, the command li
 - [MQTT (OSE and ScoreConnect clients)](#mqtt-ose-and-scoreconnect-clients)
 - [Data fields](#data-fields)
 - [Scoreboard brands](#scoreboard-brands)
+- [Without a ScoreBot](#without-a-scorebot)
 - [Fixing a value that reads wrong (`custom_fields`)](#fixing-a-value-that-reads-wrong-custom_fields)
 - [Mac, Linux and Raspberry Pi details](#mac-linux-and-raspberry-pi-details)
 - [Command line](#command-line)
@@ -87,6 +88,19 @@ ScoreReader can decode about 300 brand/sport layouts, which covers everything Sc
 - **Daktronics All Sport 5000 (built-in)** is the default. It detects football or soccer from the console by itself and handles known board quirks (such as soccer corners on the stats panel).
 - **Bot setup:** when you choose another brand, ScoreReader sets up the ScoreBot for it the first time it connects, using the same commands and speed ScoreConnect uses, and remembers that. **Re-init bot** sends the setup again.
 - **Not yet tested on real boards:** the other brands were written from ScoreConnect's decoder tables and tested with made-up data. If something reads wrong, send a capture (`logs/raw_*.bin`) along with the brand and sport. Each brand's wire format is in [vendors/](vendors/).
+
+## Without a ScoreBot
+
+ScoreReader only needs the console's raw bytes, so other hardware can stand in for the ScoreBot (details and build files in [`hardware/`](../hardware/README.md)):
+
+- **Plain USB-RS232 adapter:** for RS-232 outputs (Colorado Timing, the All Sport 5000's J6 RTD port). Set **Source: Serial**, the adapter's port, and the console's baud.
+- **ScoreBridge** (`hardware/scorebridge/`): our own board around a WT32-ETH01, with current-loop, RS-232 and RS-485 inputs.
+  - Over Ethernet or Wi-Fi: set **Source: TCP**, the bridge's IP, port **10001**.
+  - Over USB: set **Source: Serial** at **115200**.
+  - The console's speed and polarity are set on the bridge's own web page.
+- **Nano bridge** (`hardware/nano-bridge/`): an Arduino Nano and an H11L1 optocoupler, for current-loop consoles. Set **Source: Serial** at **115200**.
+
+On these, ScoreReader can't set up the input for a brand automatically the way it does for the ScoreBot. Set the speed and polarity on the device itself. Brands the ScoreBot's own chip decodes (Nevco, Daktronics All Sport 4000, Fair-Play MP-69/70) still need the ScoreBot.
 
 ## Fixing a value that reads wrong (`custom_fields`)
 

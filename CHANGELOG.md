@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+- **Hardware (new `hardware/` folder):** ways to read a console without a ScoreBot.
+  - **ScoreBridge:** a WT32-ETH01 carrier board (KiCad project, Gerbers/BOM/CPL for PCBWay, schematic). It has a current-loop input on an optocoupler, plus RS-232 and RS-485 inputs. It comes with a 3D-printed case and ESP32 firmware that streams the raw console bytes to ScoreReader's TCP source (port 10001) or over USB.
+  - **Nano bridge:** an Arduino Nano sketch for current-loop consoles over USB.
+  - None of it has been built or tested on hardware yet.
+
 ## 2.1.2 — 2026-11-08
 - **Windows download is now a `.zip`:** `ScoreReader-windows-x64.zip` contains a `ScoreReader` folder with `ScoreReader.exe`; extract it and run the `.exe`. The single self-extracting `.exe` was being flagged by Windows Defender as a virus (a false positive common to packaged Python apps); a plain folder, plus real version details on the `.exe` (Properties > Details), makes that much less likely.
 - **Release version:** release builds take their version from the tag, so the apps always report the right version (2.1.1 shipped saying 2.1.0).
