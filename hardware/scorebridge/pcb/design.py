@@ -148,6 +148,34 @@ for i, (ref, rref, name, net, colour) in enumerate([
 for i, (x, y) in enumerate(HOLES, 1):
     part(f"H{i}", "M3", "MountingHole:MountingHole_3.2mm_M3", "Mechanical:MountingHole", (x, y, 0), {})
 
+# exact part numbers for the generic passives, so the assembly BOM has no blanks
+PASSIVE_MPN = {
+    ("R_0805", "5.1k"): "RC0805FR-075K1L", ("R_0805", "470"): "RC0805FR-07470RL",
+    ("R_0805", "10k"): "RC0805FR-0710KL", ("R_0805", "1k"): "RC0805FR-071KL",
+    ("R_0805", "120"): "RC0805FR-07120RL", ("R_0805", "47k"): "RC0805FR-0747KL",
+    ("R_0805", "330"): "RC0805FR-07330RL", ("R_1206", "100"): "RC1206FR-07100RL",
+    ("C_0805", "100n"): "CL21B104KBCNNNC", ("C_0805", "1u"): "CL21B105KBFNNNE",
+    ("C_0805", "10u"): "CL21A106KAYNNNE",
+}
+for _ref, _p in P.items():
+    for (_fp, _val), _mpn in PASSIVE_MPN.items():
+        if f":{_fp}_" in _p["fp"] and _p["value"] == _val and not _p["mpn"]:
+            _p["mpn"] = _mpn
+P["D2"]["mpn"] = "1N4148W-7-F"
+P["Q1"]["mpn"] = P["Q2"]["mpn"] = "MMBT3904LT1G"
+
+MANUFACTURER = {"RC": "Yageo", "CL21": "Samsung", "1N4148W-7": "Diodes Inc", "MMBT3904LT1G": "onsemi",
+                "USBLC6": "STMicroelectronics", "MF-NSMF": "Bourns", "TYPE-C-31": "HRO (Korean Hroparts)",
+                "CH340C": "WCH", "MAX3": "Analog Devices", "KMR2": "C&K", "H11L1M": "onsemi", "WT32": "Wireless-Tag"}
+
+
+def manufacturer(mpn):
+    return next((m for k, m in MANUFACTURER.items() if mpn.startswith(k)), "")
+
+
+# parts PCBWay should place: SMD only, no solder jumpers (they're just copper), nothing marked do-not-fit
+NOT_PLACED = {"JP1", "JP2", "J3"}
+
 POWER_NETS = {"GND", "+5V", "+3V3", "VBUS"}
 
 LED_COLOURS = {"D3": "red", "D4": "green", "D5": "yellow", "D6": "orange"}

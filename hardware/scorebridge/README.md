@@ -16,7 +16,7 @@ The board is a carrier for a **WT32-ETH01** module (ESP32 with Ethernet and Wi-F
 | Path | What it is |
 |---|---|
 | `pcb/fab/scorebridge-gerbers.zip` | **Upload this to PCBWay** (Gerbers and drill files) |
-| `pcb/fab/scorebridge-bom.csv`, `pcb/fab/scorebridge-cpl.csv` | Bill of materials and pick-and-place file, only needed if PCBWay assembles it |
+| `pcb/fab/scorebridge-bom.csv`, `pcb/fab/scorebridge-cpl.csv` | Assembly BOM and pick-and-place file (surface-mount parts only), only needed if PCBWay assembles it. `scorebridge-bom-full.csv` lists every part. |
 | `pcb/scorebridge.kicad_pro` / `.kicad_pcb` / `.kicad_sch` | The KiCad 7 project. Open it to look around or to edit it. |
 | `pcb/scorebridge.pdf` | Schematic, printable |
 | `pcb/design.py` | The design itself: parts, nets, placement and DB9 pinout. The scripts below build everything from it. |
@@ -27,20 +27,51 @@ The board is a carrier for a **WT32-ETH01** module (ESP32 with Ethernet and Wi-F
 
 ## 1. Order the board
 
-On PCBWay, choose **PCB Instant Quote**, upload `pcb/fab/scorebridge-gerbers.zip`, and use these settings:
+### Bare board (PCB Instant Quote)
+
+Upload `pcb/fab/scorebridge-gerbers.zip`.
 
 | Setting | Value |
 |---|---|
+| Board type | Single pieces |
+| Size | 75 × 61 mm |
 | Layers | 2 |
-| Size | 75 × 61 mm (read from the files) |
-| Material / thickness | FR-4, **1.6 mm** (the case is designed for 1.6 mm) |
-| Min track / spacing | 6/6 mil (the design uses 0.15 mm clearance and 0.25 mm tracks) |
-| Min hole | 0.3 mm |
-| Surface finish | HASL lead-free (or ENIG) |
-| Copper | 1 oz |
-| Solder mask / silkscreen | Any colour |
+| Material | FR-4, TG130–140 (the default) |
+| Thickness | **1.6 mm** (the case is designed for this) |
+| Min track / spacing | 6/6 mil (tracks are 0.25 mm, clearance 0.15 mm) |
+| Min hole size | **0.3 mm** (the smallest vias) |
+| Solder mask / silkscreen | Any (green / white is cheapest) |
+| Surface finish | HASL lead-free. ENIG is a little better for the fine-pitch USB-C and SOIC pads if you're having it assembled. |
+| Via process | Tenting vias |
+| Finished copper | 1 oz |
+| Edge connector, castellated holes, impedance control | No |
+| Remark | "4 plated slots 0.6 mm wide for the USB-C shell legs" |
 
-Every part can be hand-soldered (0805 passives, SOIC chips, through-hole connectors). If you'd rather PCBWay fit the small parts, add **PCB Assembly** and upload the BOM and CPL. The CPL only lists the SMD parts; you solder the through-hole parts and the WT32 yourself.
+Drill sizes, if PCBWay asks:
+
+| Holes | Sizes |
+|---|---|
+| Vias | 0.3 and 0.4 mm |
+| Plated component holes | 0.8 (H11L1), 0.9 (LEDs), 1.0 (DB9, WT32, header), 3.2 mm (DB9 bracket) |
+| Plated slots | USB-C shell, 0.6 mm wide |
+| Non-plated holes | 0.65 (USB-C pegs), 3.2 mm (case screws) |
+
+### Assembly of the small parts (optional)
+
+PCBWay places the surface-mount parts and you solder the through-hole parts yourself: the WT32 module, H11L1, DB9 and LEDs. On the quote, add **PCB Assembly**:
+
+| Setting | Value |
+|---|---|
+| Service | Turnkey (PCBWay buys the parts) |
+| Sides | Top only |
+| Unique parts | 20 |
+| SMD parts | 39 |
+| BGA/QFP | 0 |
+| Through-hole parts | 0 |
+| Files | Gerbers `pcb/fab/scorebridge-gerbers.zip`, BOM `pcb/fab/scorebridge-bom.csv`, centroid `pcb/fab/scorebridge-cpl.csv` |
+| Remark | "Top-side SMD only, per BOM and centroid file. Do not fit U1, U3, J2, J3 or D3–D6 (customer solders). JP1/JP2 are solder jumpers, nothing to place. Equivalent parts OK for resistors, capacitors, 1N4148W and MMBT3904. SP3232EEN / SP3485EN are acceptable for U4 / U5." |
+
+`scorebridge-bom-full.csv` lists every part, including the ones you solder. The board has no fiducials; if PCBWay asks, let them panelize it with rails and fiducials.
 
 ## 2. Parts
 
