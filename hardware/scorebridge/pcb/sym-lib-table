@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "scorebridge")(type "KiCad")(uri "${KIPRJMOD}/scorebridge.kicad_sym")(options "")(descr "ScoreBridge parts"))
+)

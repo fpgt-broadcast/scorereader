@@ -19,6 +19,7 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 | `docs/PROTOCOL.md` | Wire formats: ScoreLinkII/MCP2221/PIC, current loop, RTD, MQTT/sbdata. **Read this before touching decoders.** |
 | `tests/` | pytest. `conftest.make_cl_frame()` builds current-loop frames. `test_current_loop.py` contains real captured soccer bytes. |
 | `windows/` | `.bat` launchers for non-technical operators, plus `build_exe.bat` |
+| `hardware/` | ScoreBot alternatives: `scorebridge/` (KiCad board generated from `pcb/design.py` by `build.sh`/`make_sch.py`, OpenSCAD case, ESP32 firmware streaming raw bytes on TCP 10001 and USB) and `nano-bridge/` (Arduino sketch). Nothing here is imported by ScoreReader. |
 | `.github/workflows/ci.yml` | tests on Windows and Linux, PyInstaller exe artifact, release on `v*` tag |
 
 ## Data flow

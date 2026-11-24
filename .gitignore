@@ -10,3 +10,9 @@ scorereader_state.bin*
 logs/
 text_out/
 windows/version_info.txt
+# KiCad per-user / generated scratch files
+*.kicad_prl
+*-backups/
+fp-info-cache
+hardware/scorebridge/pcb/fab/gerbers/
+hardware/scorebridge/firmware/.pio/
