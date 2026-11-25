@@ -1,0 +1,30 @@
+Mfg Part #,Manufacturer,Description,Per board,Buy (5 boards + spares),Designators,Notes
+CL21B104KBCNNNC,Samsung,"Capacitor 100nF 50V X7R 0805",9,100,"C3,C7-C14","any 0805 100nF X7R works"
+CL21B105KBFNNNE,Samsung,"Capacitor 1uF 50V X7R 0805",1,20,C4,"any 0805 1uF works"
+CL21A106KAYNNNE,Samsung,"Capacitor 10uF 25V X5R 0805",2,20,"C5,C6","any 0805 10uF 10V+ works"
+RC0805FR-075K1L,Yageo,"Resistor 5.1k 1% 0805",2,20,"R1,R2","USB-C CC pull-downs"
+RC0805FR-071KL,Yageo,"Resistor 1k 1% 0805",4,50,"R4,R11,R12,R13",
+RC0805FR-0710KL,Yageo,"Resistor 10k 1% 0805",2,20,"R5,R6",
+RC0805FR-07470RL,Yageo,"Resistor 470R 1% 0805",1,10,R7,
+RC0805FR-07120RL,Yageo,"Resistor 120R 1% 0805",1,10,R8,"RS-485 termination (only used if JP2 bridged)"
+RC0805FR-0747KL,Yageo,"Resistor 47k 1% 0805",2,20,"R9,R10",
+RC0805FR-07330RL,Yageo,"Resistor 330R 1% 0805",3,20,"R14,R15,R16",
+RC1206FR-07100RL,Yageo,"Resistor 100R 1% 1206",1,10,R3,"current-loop series resistor"
+1N4148W-7-F,Diodes Inc,"Diode 1N4148W SOD-123",1,10,D2,
+MMBT3904LT1G,onsemi,"NPN transistor MMBT3904 SOT-23",2,20,"Q1,Q2",
+MF-NSMF050-2,Bourns,"PTC resettable fuse 0.5A hold 1206",1,10,F1,
+TYPE-C-31-M-12,HRO (Korean Hroparts),"USB-C receptacle 16-pin SMD",1,8,J1,"buy extras: the hardest part to hand-solder"
+USBLC6-2SC6,STMicroelectronics,"USB ESD protection SOT-23-6",1,7,U6,
+CH340C,WCH,"USB to UART bridge SOIC-16 (no crystal)",1,6,U2,"must be the C version"
+SP3232EEN-L/TR,MaxLinear,"RS-232 transceiver 3.3V SOIC-16 narrow",1,6,U4,"MAX3232 equivalent, same pinout"
+SP3485EN-L/TR,MaxLinear,"RS-485 transceiver 3.3V SOIC-8",1,6,U5,"MAX3485 equivalent, same pinout"
+KMR221GLFS,C&K,"Tactile switch 4.2x2.8mm SMD",2,12,"SW1,SW2","RESET and BOOT"
+H11L1M,onsemi,"Optocoupler Schmitt trigger DIP-6",1,6,U3,"through-hole"
+(see notes),any,"DB9 male right-angle PCB mount, metal bracket, #4-40 inserts",1,5,J2,"check drawing: pins 6-9 row 7.7 mm and pins 1-5 row 10.54 mm behind board edge; mounting holes 25 mm apart, 9.12 mm behind edge"
+(generic),any,"LED 3mm diffused red",1,10,D3,"PWR"
+(generic),any,"LED 3mm diffused green",1,10,D4,"NET"
+(generic),any,"LED 3mm diffused yellow",1,10,D5,"CLIENT"
+(generic),any,"LED 3mm diffused orange",1,10,D6,"DATA"
+WT32-ETH01,Wireless-Tag,"ESP32 + Ethernet module",1,5,U1,"Amazon/AliExpress; original, not -EVO; header pins on the bottom"
+(generic),any,"M3 x 12 mm screw (socket or button head)",4,20,case,
+(generic),any,"M3 heat-set insert, M3 x 5.7 mm, for 4.0 mm hole",4,20,case,"or skip and use M3 self-tapping screws (set insert_d = 2.6 in the .scad)"

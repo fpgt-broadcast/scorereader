@@ -21,6 +21,7 @@ The board is a carrier for a **WT32-ETH01** module (ESP32 with Ethernet and Wi-F
 | `pcb/scorebridge.pdf` | Schematic, printable |
 | `pcb/design.py` | The design itself: parts, nets, placement and DB9 pinout. The scripts below build everything from it. |
 | `case/scorebridge_case.scad` | The case, in OpenSCAD |
+| `parts-to-buy.csv` | Shopping list for hand-building 5 boards (cheaper equivalent chips, spares included) |
 | `case/stl/` | Ready-to-print `bottom.stl`, `top.stl` and `fit-coupon.stl` |
 | `firmware/` | ESP32 firmware (PlatformIO, or Arduino IDE via `ScoreBridge/ScoreBridge.ino`) |
 | `images/` | Renders of the board and case |
@@ -74,6 +75,21 @@ PCBWay places the surface-mount parts and you solder the through-hole parts your
 `scorebridge-bom-full.csv` lists every part, including the ones you solder. The board has no fiducials; if PCBWay asks, let them panelize it with rails and fiducials.
 
 ## 2. Parts
+
+**Soldering it all yourself (cheapest):** order the bare boards only, and buy the parts in `parts-to-buy.csv`. It has quantities for 5 boards plus spares, using the cheaper SP3232EEN / SP3485EN equivalents.
+- **Ordering:** most distributors' BOM tools (LCSC, DigiKey, Mouser) accept that CSV and look up the parts by "Mfg Part #".
+- **Where:** LCSC carries all of them. DigiKey and Mouser may not stock the CH340C or the HRO USB-C connector.
+- **The WT32-ETH01 modules** come from Amazon or AliExpress.
+
+Soldering order:
+1. **USB-C first,** while nothing is in the way. It's the only fine-pitch part (0.5 mm): tack one shell leg, flux the pads generously, drag-solder the row, then clear any bridges with solder wick. The extras in the list are for practice.
+2. **The SOIC chips and the SOT-23 / SOT-23-6 parts.**
+3. **The 0805 / 1206 resistors and capacitors.**
+4. **The switches.**
+5. **The through-hole parts** (section 3).
+
+Check for shorts between 5V, 3V3 and GND with a meter before fitting the WT32.
+
 
 The full list is in `pcb/fab/scorebridge-bom.csv`. The parts worth choosing carefully:
 
