@@ -318,9 +318,11 @@ class MiniBroker:
             return
         done = threading.Event()
 
-        async def _shutdown():
+        def close_all():
             for srv in self._servers:
-                srv.close()
+                cc = getattr(srv, "close_clients", None)  # Python 3.13+: also connections still being accepted
+                if cc:
+                    cc()
             for c in list(self.clients):
                 try:
                     c.s.close()
@@ -331,17 +333,22 @@ class MiniBroker:
                     w.close()
                 except Exception:
                     pass
+
+        async def _shutdown():
             for srv in self._servers:
-                try:
-                    await asyncio.wait_for(srv.wait_closed(), 1.0)
-                except Exception:
-                    pass
-            self._servers = []
-            await asyncio.sleep(0.05)  # let the transports finish closing before the loop ends
+                srv.close()
+            # A connection accepted just before the close may only get its handler a moment later: sweep a
+            # few times so it's closed too, then end the handlers that are left.
+            for _ in range(4):
+                close_all()
+                await asyncio.sleep(0.05)
             for t in asyncio.all_tasks(loop):
                 if t is not asyncio.current_task():
                     t.cancel()
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
+            close_all()
+            await asyncio.sleep(0.02)
+            self._servers = []
             self.status = "stopped"
             done.set()
             loop.stop()

@@ -60,8 +60,9 @@ def test_broker_stop_frees_its_ports():
     b.start()
     assert listening(tp) and listening(wp)
     c = socket.create_connection(("127.0.0.1", tp))
-    for _ in range(40):  # wait until the broker has picked the connection up
-        if b._writers:
+    me = c.getsockname()
+    for _ in range(60):  # wait until the broker has picked up THIS connection (not one of listening()'s probes)
+        if any(w.get_extra_info("peername") == me for w in list(b._writers)):
             break
         time.sleep(0.05)
     b.stop()
