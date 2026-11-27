@@ -5,7 +5,9 @@ The details behind the [README](../README.md): outputs, settings, the command li
 ## Contents
 - [vMix](#vmix)
 - [MQTT (OSE and ScoreConnect clients)](#mqtt-ose-and-scoreconnect-clients)
+- [Webhook](#webhook)
 - [Data fields](#data-fields)
+- [Dashboard and first-run setup](#dashboard-and-first-run-setup)
 - [Scoreboard brands](#scoreboard-brands)
 - [Without a ScoreBot](#without-a-scorebot)
 - [Fixing a value that reads wrong (`custom_fields`)](#fixing-a-value-that-reads-wrong-custom_fields)
@@ -16,7 +18,7 @@ The details behind the [README](../README.md): outputs, settings, the command li
 
 ## vMix
 
-**Data Source (easiest):** in vMix, go to *Settings → Data Sources → Add → JSON*, enter `http://localhost:8765/data.json`, and set the shortest refresh interval. XML is also served at `/data.xml` and CSV at `/data.csv`.
+**Data Source (easiest):** in vMix, go to *Settings → Data Sources → Add → XML*, enter `http://<this-computer>:8765/data.xml` (the dashboard's **Home → vMix** box has it ready to copy), and set the shortest refresh interval. JSON is also served at `/data.json` (a one-row array) and `/data.obj.json` (a plain object), and CSV at `/data.csv`. The dashboard shows when each was last read and from which address.
 
 **Direct push (fastest clock):** turn on **Settings → vMix → Push values to vMix** and enter the title input's name. To choose which title fields get which values, edit `vmix.fields` in `scorereader_config.json`:
 
@@ -50,14 +52,22 @@ ScoreReader runs its own MQTT broker that looks like ScoreConnect III's, so OSE 
 | Topics | `bot/<N>/json` (Sportzcast JSON), `bot/<N>/sbdata` (150-character string), `bot/<N>/raw` |
 | Login / QoS | none / 0, same as ScoreConnect |
 
-- **Bot number:** set it in **Settings → MQTT** (or `--mqtt-bot N`) to the number your client subscribes to.
-- **Team names:** come from **Settings → Teams**. Older configs' `mqtt.home_team_name`/`guest_team_name` still work as a fallback.
+- **Bot number:** set it in **Settings → Network outputs → MQTT** (or `--mqtt-bot N`) to the number your client subscribes to.
+- **Team names:** come from the **Teams** tab. Older configs' `mqtt.home_team_name`/`guest_team_name` still work as a fallback.
 - **Updates:** values are published on every change and at least once a second, and a new subscriber gets the latest values straight away.
 - **Existing broker:** set mode to `client` and enter the broker's host to publish into Mosquitto or similar instead.
 
+## Webhook
+
+**Settings → Network outputs → Webhook** POSTs the data to a URL whenever it changes: `Content-Type: application/json`, the same object as `/data.obj.json` (on/off values as `"1"`/`"0"`). It sends at most one POST every `webhook.min_interval_ms` (default 500 ms), always with the newest values; a failed POST is retried every 2 seconds, and the dashboard shows the last result.
+
+```json
+"webhook": {"enabled": true, "url": "http://192.168.1.20:5000/score", "min_interval_ms": 500}
+```
+
 ## Data fields
 
-`/data.json` (and XML/CSV, and the text files) carry only the fields used in the current sport; a field with no data yet is blank. The dashboard lists every field, including raw ones. To serve the raw fields too (every Daktronics RTD manual field, or every Sportzcast contract field for other brands), turn on **Settings → Advanced → Include every raw field**. On/off values are `1`/`0`.
+`/data.json` (and XML/CSV, and the text files) carry only the fields used in the current sport; a field with no data yet is blank. The dashboard lists every field, including raw ones. To serve the raw fields too (every Daktronics RTD manual field, or every Sportzcast contract field for other brands), turn on **Settings → Network outputs → JSON / CSV → Include every raw field**. On/off values are `1`/`0`.
 
 **Football**
 
@@ -77,9 +87,30 @@ ScoreReader runs its own MQTT broker that looks like ScoreConnect III's, so OSE 
 
 **Fields follow the sport.** A basketball game has no `down_distance` or `ball_on`, and MQTT sends a basketball message, not a football one. On the built-in Daktronics decoder, football (console code 6601) and soccer (7601) use ScoreReader's own layouts; any other console code (basketball 1101/1103, baseball 5501, hockey 4401, volleyball 2101, wrestling 3101 …) switches automatically to ScoreConnect's layout for that sport. The default vMix field list is for football; for other sports, map their fields in `vmix.fields`.
 
-**Every sport** also has `home_name`, `guest_name`, `home_abbr`, `guest_abbr`, `home_color` and `guest_color` from Settings → Teams.
+**Every sport** also has `home_name`, `guest_name`, `home_abbr`, `guest_abbr`, `home_color` and `guest_color` from the Teams tab.
 
 **Other sports and brands** add their own fields (for example `shot_clock`, `home_fouls`, `balls`, `strikes`, `outs`), and, with **Include every raw field** on, every field of the Sportzcast contract in snake_case (or, for Daktronics RTD, every field in the Daktronics RTD manual).
+
+## Dashboard and first-run setup
+
+The dashboard (`http://<this-computer>:8765/`) has four tabs:
+
+- **Home:** where the data comes from, the game right now (with the sport's own extras: down & distance, shot clock, balls-strikes-outs, shots, fouls …), the vMix Data Source address and SetText push, and **Network outputs** (MQTT, JSON, CSV, webhook), folded shut until you open it.
+- **Teams:** names, abbreviations and colours that override what the console sends, with a swap button.
+- **Diagnostics:** every field, the console addresses or raw RTD buffer, the log and the last bytes, plus Record raw bytes, Replay a capture, Demo game and Re-init bot.
+- **Settings:** Scoreboard input, vMix, Network outputs, Files and Advanced, and **Run setup again**.
+
+**First-run setup** opens when `scorereader_config.json` is new (`"setup_done": false`). Configs from older versions count as already set up. The device search (`GET /api/discover`):
+
+1. asks the network for ScoreBridges by mDNS (`_scorebridge._tcp.local`, which the ScoreBridge firmware announces) and tries the name `scorebridge.local`;
+2. only if that finds nothing, scans this computer's /24 for TCP port 10001 and keeps the hosts whose `http://<ip>/api/status` answers like a ScoreBridge (a few seconds);
+3. lists USB serial ports: the ScoreBot (MCP2221, 04D8:00DD), the ScoreBridge's CH340 (any CH340 cable looks the same), and other USB-serial adapters.
+
+A ScoreBridge found by mDNS is saved by its `.local` name; one found by the scan is saved by IP, so give it a fixed IP on its settings page.
+
+**ScoreBridge network (DHCP or static IP).** Needs ScoreBridge firmware 1.1 or newer. With the source set to a ScoreBridge on USB (Serial) or on the network (TCP), Settings › Scoreboard input shows a **ScoreBridge network** card: what address it has now, DHCP or Static IP, and **Send to ScoreBridge**. The box restarts (about 5 s). Over the network, ScoreReader then reads it at its new address (the static IP, or `name.local` for DHCP). In first-run setup, picking a ScoreBridge on USB offers **Put it on the network**: the address is sent over USB, ScoreReader waits for the box to answer on the network and switches to it.
+
+API: `GET /api/bridge/network[?via=usb&port=COM7 | ?via=net&host=…]`, `POST /api/bridge/network` `{"dhcp": false, "ip": "192.168.1.50", "mask": "255.255.255.0", "gateway": "192.168.1.1", "dns": "", "hostname": "scorebridge"}` (plus optional `via`/`port`/`host`; default = the current source), `POST /api/bridge/wait` `{"address": "…"}`. On the box: `GET/POST /api/network` (form fields `host ip mask gw dns`, blank ip = DHCP); on USB one line `@SB GET` or `@SB NET host=… ip=… mask=… gw=… dns=…`, answered with JSON between `\r\n@SB>` and `<@SB\r\n`. A settings password on the box blocks changes over the network (change them on its own page).
 
 ## Scoreboard brands
 
@@ -95,7 +126,7 @@ ScoreReader only needs the console's raw bytes, so other hardware can stand in f
 
 - **Plain USB-RS232 adapter:** for RS-232 outputs (Colorado Timing, the All Sport 5000's J6 RTD port). Set **Source: Serial**, the adapter's port, and the console's baud.
 - **ScoreBridge** (`hardware/scorebridge/`): our own board around a WT32-ETH01, with current-loop, RS-232 and RS-485 inputs.
-  - Over Ethernet or Wi-Fi: set **Source: TCP**, the bridge's IP, port **10001**.
+  - Over Ethernet or Wi-Fi: the setup finds it by itself. By hand: **Source: Network**, the bridge's name or IP, port **10001**.
   - Over USB: set **Source: Serial** at **115200**.
   - The console's speed and polarity are set on the bridge's own web page.
 - **Nano bridge** (`hardware/nano-bridge/`): an Arduino Nano and an H11L1 optocoupler, for current-loop consoles. Set **Source: Serial** at **115200**.
@@ -156,7 +187,7 @@ Command-line options apply to that session only and are never saved.
 
 ## Settings file
 
-Settings are stored in `scorereader_config.json` next to the program (on the Mac app, in `~/Library/Application Support/ScoreReader`), which is created on first run. The Settings panel edits it for you; demo and replay are never saved, so ScoreReader always starts on live data. Raw bytes are logged to `logs/raw_*.bin` unless you turn that off.
+Settings are stored in `scorereader_config.json` next to the program (on the Mac app, in `~/Library/Application Support/ScoreReader`), which is created on first run. The dashboard's Settings tab edits it for you; demo and replay are never saved, so ScoreReader always starts on live data. Every change applies as soon as you save, MQTT and the dashboard port included (after a port change the dashboard reopens on the new port; update the vMix data source URL to match). If the new dashboard port is already in use, nothing changes. Raw bytes are logged to `logs/raw_*.bin` unless you turn that off.
 
 ## Development
 

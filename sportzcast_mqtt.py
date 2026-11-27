@@ -302,15 +302,67 @@ class MiniBroker:
         self.retained: dict[str, bytes] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.status = "starting"
+        self._servers: list = []
+        self._writers: set = set()  # every open connection, registered or not, so stop() can close them
+        self._ready = threading.Event()
 
     # ---- public (thread-safe)
     def start(self):
         threading.Thread(target=self._thread, daemon=True, name="mqtt-broker").start()
 
+    def stop(self, timeout: float = 3.0):
+        """Close the listening ports and every client, then end the broker thread."""
+        self._ready.wait(timeout)
+        loop = self.loop
+        if not loop or loop.is_closed():
+            return
+        done = threading.Event()
+
+        def close_all():
+            for srv in self._servers:
+                cc = getattr(srv, "close_clients", None)  # Python 3.13+: also connections still being accepted
+                if cc:
+                    cc()
+            for c in list(self.clients):
+                try:
+                    c.s.close()
+                except Exception:
+                    pass
+            for w in list(self._writers):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+        async def _shutdown():
+            for srv in self._servers:
+                srv.close()
+            # A connection accepted just before the close may only get its handler a moment later: sweep a
+            # few times so it's closed too, then end the handlers that are left.
+            for _ in range(4):
+                close_all()
+                await asyncio.sleep(0.05)
+            for t in asyncio.all_tasks(loop):
+                if t is not asyncio.current_task():
+                    t.cancel()
+            await asyncio.sleep(0.05)
+            close_all()
+            await asyncio.sleep(0.02)
+            self._servers = []
+            self.status = "stopped"
+            done.set()
+            loop.stop()
+
+        try:
+            loop.call_soon_threadsafe(lambda: loop.create_task(_shutdown()))
+        except RuntimeError:
+            return
+        done.wait(timeout)
+
     def publish(self, topic: str, payload: bytes | str, retain=True):
         if isinstance(payload, str):
             payload = payload.encode("utf-8")
-        if self.loop:
+        if self.loop and not self.loop.is_closed() and self.status != "stopped":
             self.loop.call_soon_threadsafe(self._publish, topic, payload, retain)
 
     @property
@@ -321,19 +373,23 @@ class MiniBroker:
     def _thread(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._serve())
+        try:
+            self.loop.run_until_complete(self._serve())
+        finally:
+            self._ready.set()
         self.loop.run_forever()
+        self.loop.close()
 
     async def _serve(self):
         ok = []
         try:
-            await asyncio.start_server(self._on_tcp, self.host, self.tcp_port)
+            self._servers.append(await asyncio.start_server(self._on_tcp, self.host, self.tcp_port))
             ok.append(f"mqtt://:{self.tcp_port}")
         except OSError as e:
             self.log(f"MQTT: can't listen on {self.tcp_port}: {e} (is ScoreConnect/Mosquitto still running?)")
         if self.ws_port:
             try:
-                await asyncio.start_server(self._on_ws, self.host, self.ws_port)
+                self._servers.append(await asyncio.start_server(self._on_ws, self.host, self.ws_port))
                 ok.append(f"ws://:{self.ws_port}/mqtt")
             except OSError as e:
                 self.log(f"MQTT: can't listen on {self.ws_port}: {e}")
@@ -349,9 +405,20 @@ class MiniBroker:
                 c.publish(topic, payload)
 
     async def _on_tcp(self, r, w):
-        await self._session(_Stream(r, w), w.get_extra_info("peername"))
+        self._writers.add(w)
+        try:
+            await self._session(_Stream(r, w), w.get_extra_info("peername"))
+        finally:
+            self._writers.discard(w)
 
     async def _on_ws(self, r, w):
+        self._writers.add(w)
+        try:
+            await self._on_ws_session(r, w)
+        finally:
+            self._writers.discard(w)
+
+    async def _on_ws_session(self, r, w):
         try:
             req = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 10)
         except Exception:
@@ -490,10 +557,22 @@ class MqttPublisherClient:
         self.lock = threading.Lock()
         self.status = "connecting"
         self.client_count = 0
+        self._stopped = threading.Event()
         threading.Thread(target=self._pinger, daemon=True).start()
 
     def start(self):
         pass
+
+    def stop(self):
+        self._stopped.set()
+        with self.lock:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+                self.sock = None
+        self.status = "stopped"
 
     def _connect(self):
         s = socket.create_connection((self.host, self.port), timeout=5)
@@ -518,8 +597,7 @@ class MqttPublisherClient:
             pass
 
     def _pinger(self):
-        while True:
-            time.sleep(15)
+        while not self._stopped.wait(15):
             with self.lock:
                 if self.sock:
                     try:
@@ -532,6 +610,8 @@ class MqttPublisherClient:
             payload = payload.encode("utf-8")
         vh = _mqtt_str(topic)
         pkt = bytes([0x30 | (1 if retain else 0)]) + _varint(len(vh) + len(payload)) + vh + payload
+        if self._stopped.is_set():
+            return
         with self.lock:
             try:
                 if self.sock is None:
@@ -561,6 +641,13 @@ class SportzcastMqttOutput:
         self.last_json = ""
         self.lock = threading.Lock()
         self.event = threading.Event()
+        self.stopped = False
+
+    def stop(self):
+        """Stop publishing and free the broker ports (Settings changes apply without restarting ScoreReader)."""
+        self.stopped = True
+        self.event.set()
+        self.out.stop()
 
     @property
     def bot(self) -> int:
@@ -610,9 +697,11 @@ class SportzcastMqttOutput:
             self.out.publish(f"bot/{self.bot}/raw", chunk, retain=False)
 
     def _loop(self):
-        while True:
+        while not self.stopped:
             self.event.wait(self.heartbeat)
             self.event.clear()
+            if self.stopped:
+                break
             with self.lock:
                 d, contract = self.latest, self.latest_contract
             if d is None:

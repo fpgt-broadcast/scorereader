@@ -11,6 +11,8 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 | File | Role |
 |---|---|
 | `scorereader.py` | Everything except MQTT: config, serial/HID (`MCP2221`, `WinHID`), PIC commands, sources (`Reader`: scorelink, serial, tcp, demo, replay), decoders (`DaktronicsRTD`, `DaktronicsCurrentLoop`, `SportMap`), outputs (`VmixPusher`, text files), HTTP server and dashboard (`App`, `DASHBOARD_HTML`), CLI |
+| `discovery.py` | First-run device search (`/api/discover`): ScoreBridge by mDNS `_scorebridge._tcp`, `scorebridge.local`, then a /24 scan of port 10001 confirmed by `/api/status`; USB ports classified (ScoreBot MCP2221, CH340 = ScoreBridge USB). Dependency-free. |
+| `bridgecfg.py` | ScoreBridge network settings (DHCP / static): `clean_network` checks, `http_get/set` (`/api/network`, firmware 1.1+), USB `@SB GET|NET` lines with `ReplySplitter` taking the framed reply out of the console stream. `App.bridge_network` picks USB or network from the source; over USB with the serial source on that port it goes through `Reader.bridge_request` (port already open). Dashboard: Settings › Scoreboard input card, and the wizard's "Put it on the network" for a ScoreBridge on USB. |
 | `sportzcast_mqtt.py` | `build_payloads()` (Sportzcast JSON plus 150-char sbdata, football and soccer), `MiniBroker` (dependency-free MQTT 3.1/3.1.1/5 broker with WebSocket support), `MqttPublisherClient`, `SportzcastMqttOutput` glue |
 | `scoreboards/` | Multi-vendor decoders: `base.py` (Protocol/Decoder framework), `common.py` (digit/BCD/checksum helpers), `pic55aa.py` (PIC decode-mode framing), one module per brand, `contracts.py` (contract → output fields, Sportzcast JSON, sbdata, clock-status emulation), `hardware.py` (bot set-up per wiring option), `catalog.json` (brands, sports, wiring from ScoreConnect's config DB). Per-brand wire docs in `docs/vendors/`. |
 | `linux/`, `mac/` | `install.sh` (packages, udev rule, hid_mcp2221 blacklist, optional systemd service), launchers |
@@ -30,7 +32,8 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 - **The current-loop sport** is chosen from the console code at address `0xFE` (`CODE_SPORT`: 6601 = football, 7601 = soccer). Any other code ScoreConnect knows (1101 basketball, 5501 baseball …) is decoded by `scoreboards.daktronics` Autodetect, fed in parallel (`App.cl_other`); `vendor_contract()` picks it. For RTD sports other than football/soccer, `rtd_contract()` maps the fields into the right Sportzcast contract for MQTT.
 - **`custom_fields`** in the config override or add fields after decoding (`DaktronicsCurrentLoop._custom`).
 - **Other brands:** when `scoreboard.protocol` is set (a ScoreConnect vendor-sport id), `App._new_decoders` creates `scoreboards.create(id)`, `Reader._feed` sends bytes only there, and `App.build_data` uses `contract_to_data()` → `contracts.flat()`. MQTT uses `contracts.sportzcast_json/sbdata`. `App.bot_plan()` gives the PIC commands/baud for the brand's wiring; they're sent once per brand/wiring (`scorelink.configured_for`). Blank protocol = the original Daktronics path, untouched.
-- **Config:** `App.cfg` is the running config (file + CLI options); `App.saved` is what's on disk. `apply_settings()` validates against `SETTINGS`, writes only `saved`, never persists demo/replay, and restarts the reader or vMix when needed.
+- **Dashboard:** tabs Home / Teams / Diagnostics / Settings plus a first-run wizard (shown while `setup_done` is false; `load_config` marks configs from older versions as done). `App.outputs_json()` feeds Home (who read data.xml/json/csv and when, MQTT clients, webhook). The webhook (`WebhookPusher`) POSTs `flatten(public(d))` on change. UI changes: show Jack mockups first.
+- **Config:** `App.cfg` is the running config (file + CLI options); `App.saved` is what's on disk. `apply_settings()` validates against `SETTINGS`, writes only `saved`, never persists demo/replay, and applies every change in place: it restarts the reader, vMix, webhook or MQTT (`restart_mqtt`, `stop()` frees the broker ports), and for `http_port` binds the new port first (port in use = nothing changes) then closes the old server (`restart_http`, reply carries `moved_to_port`). No setting needs a ScoreReader restart.
 
 ## Conventions and gotchas
 - **Dependencies:** keep runtime deps to `pyserial` only (`hidapi` only on macOS/Linux). `hidapi` fails to build on new Python versions on Windows, which is why `WinHID` uses ctypes. Keep `scorereader.py` importable without `hid`.
@@ -45,7 +48,7 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 ## Commands
 ```bash
 python -m pytest -q                       # run before every commit
-python -m pyflakes scorereader.py sportzcast_mqtt.py scoreboards
+python -m pyflakes scorereader.py sportzcast_mqtt.py discovery.py bridgecfg.py scoreboards
 python scorereader.py --demo              # dashboard on :8765, MQTT on :1883/:8083
 python scorereader.py --replay logs/raw_X.bin --no-mqtt
 python scorereader.py --list-scoreboards  # every brand/sport id

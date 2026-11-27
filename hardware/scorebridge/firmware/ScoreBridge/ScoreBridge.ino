@@ -3,7 +3,8 @@
 // Reads the scoreboard console on one of three inputs (20 mA current loop through an optocoupler, RS-232,
 // RS-485/422) and streams the raw bytes, untouched, to every TCP client (ScoreReader's "TCP" source) and to the
 // USB port (ScoreReader's "Serial" source at 115200). Configure it from its web page (http://scorebridge.local/
-// or its IP address). Builds with the Arduino-ESP32 core 2.0.x or 3.x (PlatformIO: see ../platformio.ini).
+// or its IP address), or from ScoreReader: GET/POST /api/network on the network, "@SB" command lines on USB
+// (see handleUsbLine below). Builds with the Arduino-ESP32 core 2.0.x or 3.x (PlatformIO: see ../platformio.ini).
 //
 // Pins (carrier board v1.0): current loop IO35, RS-232 IO14, RS-485 IO4; LEDs NET IO32, CLIENT IO33, DATA IO2.
 
@@ -16,7 +17,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 
 // ---------------------------------------------------------------- hardware
 static const int PIN_IN_CL = 35;
@@ -61,6 +62,9 @@ uint64_t bytesIn = 0;
 uint32_t lastByteMs = 0, rateBytes = 0, rateMs = 0, rateBps = 0;
 uint8_t recent[48];
 size_t recentLen = 0;
+
+String jsonStr(const String &s);
+bool parseIp(const String &s, IPAddress &out);
 
 void logln(const String &s) {
   if (!cfg.usbMirror) Serial.println(s);
@@ -263,6 +267,110 @@ void sendToClients(const uint8_t *buf, size_t n) {
   }
 }
 
+// ---------------------------------------------------------------- network settings (web API and USB commands)
+String netJson() {
+  String j = "{";
+  j += "\"hostname\":" + jsonStr(cfg.hostname);
+  j += ",\"dhcp\":" + String(cfg.ip.length() ? "false" : "true");
+  j += ",\"ip\":" + jsonStr(cfg.ip);
+  j += ",\"mask\":" + jsonStr(cfg.mask);
+  j += ",\"gateway\":" + jsonStr(cfg.gateway);
+  j += ",\"dns\":" + jsonStr(cfg.dns);
+  j += ",\"tcp_port\":" + String(cfg.tcpPort);
+  j += ",\"current_ip\":" + jsonStr(ethUp ? ETH.localIP().toString() : String(""));
+  j += ",\"link\":" + String(ETH.linkUp() ? "true" : "false");
+  j += ",\"mac\":" + jsonStr(ETH.macAddress());
+  j += ",\"version\":" + jsonStr(FW_VERSION);
+  j += "}";
+  return j;
+}
+
+bool validHostname(const String &h) {
+  if (!h.length() || h.length() > 32 || h[0] == '-') return false;
+  for (char c : h)
+    if (!isalnum((unsigned char)c) && c != '-') return false;
+  return true;
+}
+
+// Checks and stores new Ethernet settings. ip blank = DHCP. Returns "" when saved, else the reason.
+// *changed tells the caller to restart (the network stack only takes a new address at start-up).
+String applyNetwork(String host, String ip, String mask, String gw, String dns, bool *changed) {
+  IPAddress a;
+  host.trim(); ip.trim(); mask.trim(); gw.trim(); dns.trim();
+  if (!host.length()) host = cfg.hostname;
+  if (!validHostname(host)) return "name: letters, digits and - only (max 32)";
+  if (ip.length()) {
+    if (!parseIp(ip, a)) return "IP address is not valid";
+    if (!mask.length()) mask = "255.255.255.0";
+    if (!parseIp(mask, a)) return "subnet mask is not valid";
+    if (gw.length() && !parseIp(gw, a)) return "gateway is not valid";
+    if (dns.length() && !parseIp(dns, a)) return "DNS is not valid";
+  } else {
+    mask = gw = dns = "";  // DHCP: nothing else applies
+  }
+  *changed = host != cfg.hostname || ip != cfg.ip || mask != cfg.mask || gw != cfg.gateway || dns != cfg.dns;
+  cfg.hostname = host; cfg.ip = ip; cfg.mask = mask; cfg.gateway = gw; cfg.dns = dns;
+  if (*changed) saveSettings();
+  return "";
+}
+
+bool restartPending = false;
+uint32_t restartAt = 0;
+void restartSoon() { restartPending = true; restartAt = millis() + 700; }
+
+// ---------------------------------------------------------------- USB commands
+// ScoreReader sends one text line: "@SB GET" or "@SB NET host=scorebridge ip=192.168.1.50 mask=255.255.255.0
+// gw=192.168.1.1 dns=192.168.1.1" (ip= blank = DHCP). The reply is one JSON object between "\r\n@SB>" and
+// "<@SB\r\n", written in one piece so it never splits the console data around it.
+String usbLine;
+
+String argOf(const String &line, const char *key) {
+  String k = String(" ") + key + "=";
+  int i = line.indexOf(k);
+  if (i < 0) return "";
+  i += k.length();
+  int e = line.indexOf(' ', i);
+  return e < 0 ? line.substring(i) : line.substring(i, e);
+}
+
+void usbReply(const String &json) { Serial.print("\r\n@SB>" + json + "<@SB\r\n"); }
+
+void handleUsbLine(String line) {
+  line.trim();
+  if (!line.startsWith("@SB ")) return;
+  String cmd = line.substring(4);
+  int sp = cmd.indexOf(' ');
+  String verb = sp < 0 ? cmd : cmd.substring(0, sp);
+  if (verb == "GET") {
+    usbReply("{\"ok\":true,\"network\":" + netJson() + "}");
+  } else if (verb == "NET") {
+    String args = " " + (sp < 0 ? String("") : cmd.substring(sp + 1));
+    bool changed = false;
+    String err = applyNetwork(argOf(args, "host"), argOf(args, "ip"), argOf(args, "mask"), argOf(args, "gw"),
+                              argOf(args, "dns"), &changed);
+    if (err.length()) {
+      usbReply("{\"ok\":false,\"error\":" + jsonStr(err) + "}");
+      return;
+    }
+    usbReply("{\"ok\":true,\"restarting\":" + String(changed ? "true" : "false") + ",\"network\":" + netJson() + "}");
+    if (changed) restartSoon();
+  } else {
+    usbReply("{\"ok\":false,\"error\":\"unknown command\"}");
+  }
+}
+
+void pollUsb() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (usbLine.length()) handleUsbLine(usbLine);
+      usbLine = "";
+    } else if (usbLine.length() < 300) {
+      usbLine += c;
+    }
+  }
+}
+
 // ---------------------------------------------------------------- web page
 bool authorised() {
   if (!cfg.adminPass.length()) return true;
@@ -437,11 +545,32 @@ void handleApiSerial() {
   web.send(200, "application/json", statusJson());
 }
 
+// GET /api/network: the Ethernet settings. POST /api/network host=&ip=&mask=&gw=&dns= (ip blank = DHCP):
+// saves them and restarts when they changed (ScoreReader then finds the box at its new address).
+void handleApiNetwork() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  if (web.method() == HTTP_GET) {
+    web.send(200, "application/json", netJson());
+    return;
+  }
+  if (!authorised()) return;
+  bool changed = false;
+  String err = applyNetwork(web.arg("host"), web.arg("ip"), web.arg("mask"), web.arg("gw"), web.arg("dns"), &changed);
+  if (err.length()) {
+    web.send(400, "application/json", "{\"ok\":false,\"error\":" + jsonStr(err) + "}");
+    return;
+  }
+  web.send(200, "application/json",
+           "{\"ok\":true,\"restarting\":" + String(changed ? "true" : "false") + ",\"network\":" + netJson() + "}");
+  if (changed) restartSoon();
+}
+
 void startWeb() {
   web.on("/", HTTP_GET, handleRoot);
   web.on("/save", HTTP_POST, handleSave);
   web.on("/api/status", HTTP_GET, [] { web.sendHeader("Access-Control-Allow-Origin", "*"); web.send(200, "application/json", statusJson()); });
   web.on("/api/serial", HTTP_POST, handleApiSerial);
+  web.on("/api/network", HTTP_ANY, handleApiNetwork);
   web.on("/reboot", HTTP_POST, [] { if (!authorised()) return; web.send(200, "text/plain", "Restarting"); delay(300); ESP.restart(); });
   updater.setup(&web, "/update", "admin", cfg.adminPass.length() ? cfg.adminPass.c_str() : "");
   web.onNotFound([] { web.send(404, "text/plain", "Not found"); });
@@ -516,6 +645,11 @@ void loop() {
   }
   acceptClients();
   web.handleClient();
+  pollUsb();
+  if (restartPending && (int32_t)(now - restartAt) >= 0) {
+    Serial.flush();
+    ESP.restart();
+  }
   manageAccessPoint();
   updateLeds();
   if (!bootsCleared && now - bootMs > 8000) {  // ran long enough: this wasn't a reset gesture
