@@ -120,6 +120,10 @@ DEFAULT_CONFIG = {
     "teams": {"home_name": "", "guest_name": "", "home_abbr": "", "guest_abbr": "",
               "home_color": "", "guest_color": ""},
     "text_files": {"enabled": False, "folder": "text_out"},
+    # POST the data (same fields as data.obj.json) to a URL whenever it changes, at most every min_interval_ms.
+    "webhook": {"enabled": False, "url": "", "min_interval_ms": 500},
+    # False = show the first-run setup on the dashboard. Configs saved by older versions count as set up.
+    "setup_done": False,
     "record_raw": True,
     "save_state": False,             # restore the last RTD buffer after a restart (scorereader_state.bin)
     # data.json/xml/csv and text files carry only the fields used in the sport; True adds every raw field
@@ -189,7 +193,10 @@ def load_config() -> dict:
         save_config(DEFAULT_CONFIG)
         return json.loads(json.dumps(DEFAULT_CONFIG))
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return deep_merge(DEFAULT_CONFIG, json.load(f))
+        stored = json.load(f)
+    if isinstance(stored, dict) and "setup_done" not in stored:
+        stored["setup_done"] = True  # made by a version without the setup wizard: it was set up by hand
+    return deep_merge(DEFAULT_CONFIG, stored)
 
 
 def save_config(cfg: dict) -> None:
@@ -243,18 +250,22 @@ SETTINGS = {
     "vmix.host": ("vMix", "vMix host", "str", "vmix"),
     "vmix.port": ("vMix", "vMix TCP port", "port", "vmix"),
     "vmix.input": ("vMix", "Title input name or number", "str", "vmix"),
-    "mqtt.enabled": ("MQTT (OSE)", "MQTT output", "bool", "restart"),
-    "mqtt.bot_number": ("MQTT (OSE)", "Bot number (topics bot/N/…)", "int", "live"),
-    "mqtt.mode": ("MQTT (OSE)", "Mode", "choice", "restart"),
-    "mqtt.tcp_port": ("MQTT (OSE)", "Broker TCP port", "port", "restart"),
-    "mqtt.ws_port": ("MQTT (OSE)", "Broker WebSocket port", "port", "restart"),
-    "mqtt.broker_host": ("MQTT (OSE)", "External broker host (client mode)", "str", "restart"),
-    "mqtt.broker_port": ("MQTT (OSE)", "External broker port (client mode)", "port", "restart"),
+    "mqtt.enabled": ("MQTT", "MQTT output", "bool", "restart"),
+    "mqtt.bot_number": ("MQTT", "Bot number (topics bot/N/…)", "int", "live"),
+    "mqtt.mode": ("MQTT", "Mode", "choice", "restart"),
+    "mqtt.tcp_port": ("MQTT", "Broker TCP port", "port", "restart"),
+    "mqtt.ws_port": ("MQTT", "Broker WebSocket port", "port", "restart"),
+    "mqtt.broker_host": ("MQTT", "External broker host (client mode)", "str", "restart"),
+    "mqtt.broker_port": ("MQTT", "External broker port (client mode)", "port", "restart"),
+    "webhook.enabled": ("Webhook", "POST the data to a URL on every change", "bool", "webhook"),
+    "webhook.url": ("Webhook", "Webhook URL", "url", "webhook"),
+    "webhook.min_interval_ms": ("Webhook", "At most one POST every (ms)", "int", "live"),
     "text_files.enabled": ("Files", "Write one .txt file per field", "bool", "live"),
     "record_raw": ("Files", "Record raw bytes to logs/", "bool", "live"),
     "save_state": ("Files", "Remember board values after a restart (RTD only)", "bool", "live"),
     "http_port": ("Advanced", "Dashboard / data.json port", "port", "restart"),
     "output_all_fields": ("Advanced", "Include every raw field in data.json / XML / CSV", "bool", "live"),
+    "setup_done": ("Advanced", "First-run setup finished", "bool", "live"),
 }
 
 
@@ -297,6 +308,8 @@ def coerce_setting(path: str, value, choices: dict):
     v = str(value if value is not None else "").strip()
     if len(v) > 200:
         raise ValueError("is too long")
+    if kind == "url" and v and not v.lower().startswith(("http://", "https://")):
+        raise ValueError("must start with http:// or https:// (or be blank)")
     return v
 
 
@@ -321,6 +334,12 @@ class Status:
         self.pic_info: dict[str, str] = {}
         self.logs: list[str] = []
         self.recent_hex = ""
+        self.webhook_state = "disabled"
+        self.reads: dict[str, tuple[float, str]] = {}  # "/data.xml" -> (time, client address) of the last read
+
+    def note_read(self, path: str, client: str):
+        with self.lock:
+            self.reads[path] = (time.time(), client)
 
     def add_log(self, line: str):
         with self.lock:
@@ -1491,6 +1510,85 @@ class VmixPusher(threading.Thread):
         self._close()
 
 
+class WebhookPusher(threading.Thread):
+    """POSTs the latest data as JSON (the same object as /data.obj.json) to webhook.url whenever it changes,
+    at most once every webhook.min_interval_ms. Only the newest data is sent; a failed POST is retried."""
+
+    def __init__(self, cfg, stop):
+        super().__init__(daemon=True)
+        self.cfg, self.stop = cfg, stop
+        self.latest: dict | None = None
+        self.lock = threading.Lock()
+        self.event = threading.Event()
+        self.sent = 0
+
+    def submit(self, data: dict):
+        with self.lock:
+            self.latest = data
+        self.event.set()
+
+    def _interval(self) -> float:
+        try:
+            return max(0.05, int(get_path(self.cfg, "webhook.min_interval_ms", 500)) / 1000)
+        except (TypeError, ValueError):
+            return 0.5
+
+    def run(self):
+        import urllib.request
+
+        url = str(get_path(self.cfg, "webhook.url", "") or "")
+        STATUS.webhook_state = f"waiting for data · {url}"
+        last_body = None
+        while not self.stop.is_set():
+            if not self.event.wait(1):
+                continue
+            self.event.clear()
+            with self.lock:
+                d = self.latest
+            body = json.dumps(d, ensure_ascii=False).encode("utf-8")
+            if body == last_body:
+                continue
+            try:
+                req = urllib.request.Request(url, data=body, method="POST",
+                                             headers={"Content-Type": "application/json", "User-Agent": "ScoreReader"})
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    r.read(1024)
+                last_body = body
+                self.sent += 1
+                STATUS.webhook_state = f"ok · {self.sent} sent · last {_dt.datetime.now():%H:%M:%S}"
+            except Exception as e:
+                STATUS.webhook_state = f"error: {e} (retrying)"
+                self.event.set()  # try the newest data again after the wait
+                self.stop.wait(2)
+                continue
+            self.stop.wait(self._interval())
+
+
+def flatten(d: dict) -> dict:
+    """Booleans as "1"/"0", the way data.json/xml/csv and the webhook carry them."""
+    return {k: (("1" if v else "0") if isinstance(v, bool) else v) for k, v in d.items()}
+
+
+_LAN_IP = [0.0, None]
+
+
+def lan_ip() -> str:
+    """This computer's LAN address, for the copy-paste URLs on the dashboard (checked at most every 30 s)."""
+    if time.time() - _LAN_IP[0] > 30:
+        ip = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("10.255.255.255", 1))  # no packet is sent
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+        except OSError:
+            pass
+        _LAN_IP[:] = [time.time(), ip if ip and not ip.startswith("127.") else None]
+    return _LAN_IP[1] or "localhost"
+
+
 def write_text_files(folder: str, data: dict, cache: dict):
     os.makedirs(folder, exist_ok=True)
     for k, v in data.items():
@@ -1506,163 +1604,521 @@ DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Sco
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#0e1116;--card:#171b22;--ink:#e8ecf1;--mut:#8a94a3;--ok:#2fbf71;--bad:#e5484d;--warn:#f5a524;--acc:#5b8def}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,Segoe UI,sans-serif}
-header{display:flex;gap:16px;align-items:center;padding:12px 18px;border-bottom:1px solid #222a35;flex-wrap:wrap}
-h1{font-size:18px;margin:0}.pill{padding:3px 10px;border-radius:99px;background:#222a35;font-size:12px}
-.ok{background:rgba(47,191,113,.18);color:var(--ok)}.bad{background:rgba(229,72,77,.18);color:var(--bad)}.warn{background:rgba(245,165,36,.18);color:var(--warn)}
-main{padding:16px 18px;display:grid;gap:16px}
-.card{background:var(--card);border:1px solid #222a35;border-radius:10px;padding:14px}
-.bug{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center;text-align:center}
-.team{font-size:15px;color:var(--mut)}.score{font:700 64px/1 ui-monospace,Consolas,monospace}
-.mid .clock{font:700 48px/1 ui-monospace,Consolas,monospace}.mid .sub{color:var(--mut);margin-top:6px;font-size:15px}
-.poss{color:var(--warn);font-weight:700}
-table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:3px 6px;border-bottom:1px solid #222a35;text-align:left}
+:root{--bg:#0e1116;--card:#171b22;--line:#222a35;--field:#0f1319;--ink:#e8ecf1;--mut:#8a94a3;--ok:#2fbf71;--bad:#e5484d;--warn:#f5a524;--acc:#5b8def}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,Segoe UI,sans-serif}
+[hidden]{display:none!important}
+header{display:flex;gap:14px;align-items:center;padding:10px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{font-size:18px;margin:0}h2{font-size:24px;margin:0 0 6px}h3{font-size:16px;margin:0 0 10px}
+.mut{color:var(--mut)}.small{font-size:13px}.mono{font-family:ui-monospace,Consolas,monospace}
+.pill{padding:3px 10px;border-radius:99px;background:#222a35;font-size:12px;white-space:nowrap}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.okb{background:rgba(47,191,113,.18);color:var(--ok)}.warnb{background:rgba(245,165,36,.18);color:var(--warn)}.badb{background:rgba(229,72,77,.18);color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+button,select,input{font:inherit;color:var(--ink)}
+button{background:#222a35;border:1px solid #333d4b;border-radius:8px;padding:7px 13px;cursor:pointer;white-space:nowrap}
+button:hover{border-color:#4a5566}button:active{transform:translateY(1px)}
+.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.sm{padding:4px 10px;font-size:13px}
+input,select{background:var(--field);border:1px solid #333d4b;border-radius:8px;padding:8px 10px;width:100%}
+input[type=checkbox]{width:auto}
+a{color:var(--acc)}
+.tabs{display:flex;gap:4px;margin-left:12px;flex-wrap:wrap}.tabs button{background:none;border:0;color:var(--mut);padding:6px 12px;border-radius:7px}
+.tabs button.on{background:#222a35;color:var(--ink)}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex:none;background:#3a4350;vertical-align:middle}
+.dot.g{background:var(--ok);box-shadow:0 0 8px var(--ok)}.dot.y{background:var(--warn);box-shadow:0 0 8px var(--warn)}.dot.r{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-top:1px solid var(--line);gap:10px}
+.row.first{border-top:0;padding-top:0}
+.copy{font:12px ui-monospace,Consolas,monospace;background:var(--field);border:1px solid var(--line);border-radius:6px;padding:5px 8px;display:flex;justify-content:space-between;gap:8px;margin-top:6px;align-items:center}
+.copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.copy b{color:var(--ok);font-weight:400;cursor:pointer;flex:none}
+.sw{width:38px;height:22px;border-radius:11px;background:#333d4b;position:relative;flex:none;cursor:pointer;border:0;padding:0;transition:background .2s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#cfd6df;transition:left .2s}
+.sw.on{background:var(--ok)}.sw.on::after{left:19px;background:#fff}
+.banner{background:var(--warn);color:#111;padding:10px 22px;font-weight:600;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.banner button{background:#111;color:#fff;border-color:#111}
+main{padding:20px 22px}
+/* home */
+.home{display:grid;grid-template-columns:minmax(240px,300px) 1fr minmax(280px,340px);gap:18px;align-items:start}
+@media(max-width:1100px){.home{grid-template-columns:1fr 1fr}.home .game{grid-column:1/-1;order:-1}}
+@media(max-width:700px){.home{grid-template-columns:1fr}main{padding:14px 12px}header{padding:10px 12px}}
+.stack{display:flex;flex-direction:column;gap:14px}
+.home>*,.stack>*,.two>*,.teams>*{min-width:0}.gn>*{min-width:0}.tn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gn{display:grid;grid-template-columns:1fr auto 1fr;align-items:start;text-align:center;gap:10px}
+.tn{font-weight:700;letter-spacing:.04em;display:flex;align-items:center;justify-content:center;gap:8px;min-height:24px}
+.tn .arrow{color:var(--warn);font-size:18px;width:14px}
+.cbar{height:4px;border-radius:2px;margin:6px auto 0;width:70px;background:#333d4b}
+.big{font:700 72px/1 ui-monospace,Consolas,monospace;margin-top:6px}.clock{font:700 56px/1 ui-monospace,Consolas,monospace}
+@media(max-width:700px){.big{font-size:52px}.clock{font-size:40px}}
+.to{display:flex;gap:5px;justify-content:center;margin-top:10px;min-height:6px}.to i{width:16px;height:6px;border-radius:2px;background:var(--warn)}.to i.u{background:#333d4b}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(108px,1fr));gap:10px;margin-top:18px}
+.stat{background:#12161c;border:1px solid var(--line);border-radius:9px;padding:10px;text-align:center}
+.stat .v{font:700 22px ui-monospace,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.stat .k{color:var(--mut);font-size:12px}
+.fold{cursor:pointer;user-select:none}.fold .chev{display:inline-block;transition:transform .2s;color:var(--mut)}.fold.open .chev{transform:rotate(90deg)}
+.foldbody{overflow:hidden;transition:max-height .3s ease;max-height:0}.foldbody.open{max-height:600px}
+/* teams */
+.teams{display:grid;grid-template-columns:1fr 70px 1fr;gap:18px;align-items:start}
+@media(max-width:800px){.teams{grid-template-columns:1fr}}
+label.f{display:block;margin-top:14px}label.f>span{display:block;color:var(--mut);font-size:13px;margin-bottom:5px}
+.colr{display:flex;gap:8px}.colr input[type=color]{width:46px;padding:2px;height:40px;flex:none}
+/* diagnostics */
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}@media(max-width:900px){.two{grid-template-columns:1fr}}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:left}
 th{color:var(--mut);font-weight:500}td.v{font-family:ui-monospace,Consolas,monospace}
-.grid{font:12px/1.2 ui-monospace,Consolas,monospace;overflow:auto}
-.row{display:flex;white-space:pre}.row .n{width:46px;color:var(--mut)}.c{width:13px;text-align:center;border-left:1px solid #1d232c}
-.c.hot{background:var(--acc);color:#fff}.c.warm{background:rgba(91,141,239,.3)}
-.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.cols{grid-template-columns:1fr}}
-pre{margin:0;max-height:220px;overflow:auto;font-size:12px;color:var(--mut);white-space:pre-wrap}
-select,button,input{background:#222a35;color:var(--ink);border:1px solid #333d4b;border-radius:6px;padding:5px 9px}
-button{cursor:pointer}a{color:var(--acc)}.mut{color:var(--mut)}
-.banner{background:var(--warn);color:#111;padding:10px 18px;font-weight:600;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-.banner[hidden],#settings[hidden]{display:none}.banner button{background:#111;color:#fff;border-color:#111}
-.tbar{height:4px;width:60px;margin:6px auto 0;border-radius:2px}
-#settings{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;justify-content:flex-end;z-index:10}
-#settings .panel{background:var(--card);width:min(560px,100%);height:100%;overflow:auto;padding:16px 18px;border-left:1px solid #222a35}
-#settings h2{font-size:17px;margin:0 0 4px}fieldset{border:1px solid #222a35;border-radius:8px;margin:0 0 14px;padding:8px 12px}
-legend{color:var(--mut);padding:0 6px}label.set{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;padding:5px 0}
-label.set[hidden]{display:none}label.set input:not([type=checkbox]),label.set select{width:230px;max-width:52vw}
-.colr{display:flex;gap:6px}.colr input[type=color]{width:34px!important;padding:0;height:30px}
-.setbar{position:sticky;bottom:-16px;background:var(--card);padding:12px 0;display:flex;gap:10px;align-items:center;border-top:1px solid #222a35}
-.primary{background:var(--acc);border-color:var(--acc);color:#fff}#setmsg{flex:1;font-size:13px}#setmsg.bad{background:none}
+.grid{font:12px/1.2 ui-monospace,Consolas,monospace;overflow:auto}.grid .r{display:flex;white-space:pre}.grid .n{width:46px;color:var(--mut)}
+.c{width:13px;text-align:center;border-left:1px solid #1d232c}.c.hot{background:var(--acc);color:#fff}.c.warm{background:rgba(91,141,239,.3)}
+pre{margin:0;max-height:260px;overflow:auto;font-size:12px;color:var(--mut);white-space:pre-wrap}
+.tools{display:flex;gap:8px;flex-wrap:wrap}
+/* settings */
+.setwrap{display:grid;grid-template-columns:220px 1fr;gap:0;min-height:calc(100vh - 140px)}
+@media(max-width:800px){.setwrap{grid-template-columns:1fr}.snav{display:flex;flex-wrap:wrap;border-right:0!important}}
+.snav{border-right:1px solid var(--line);padding:4px 12px 0 0}.snav button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--mut);padding:9px 12px;border-radius:8px}
+.snav button.on{background:#222a35;color:var(--ink)}
+.spane{padding:0 0 0 26px;max-width:860px}@media(max-width:800px){.spane{padding:14px 0 0}}
+fieldset{border:1px solid var(--line);border-radius:12px;margin:16px 0 0;padding:6px 16px 12px;background:var(--card)}
+legend{color:var(--ink);font-weight:600;padding:0 6px}
+label.set{display:grid;grid-template-columns:1fr minmax(180px,300px);gap:12px;align-items:center;padding:7px 0}
+label.set>input[type=checkbox]{justify-self:end}
+.setbar{position:sticky;bottom:0;background:var(--bg);padding:14px 0;display:flex;gap:10px;align-items:center;margin-top:8px}
+#setmsg{flex:1;font-size:13px}
+/* reveal animation (brand -> sport -> wiring) */
+.reveal{display:grid;grid-template-rows:0fr;opacity:0;transform:translateY(-6px);transition:grid-template-rows .4s ease,opacity .3s ease .08s,transform .3s ease .08s}
+.reveal>div{overflow:hidden}.reveal.open{grid-template-rows:1fr;opacity:1;transform:none}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.chip{padding:7px 14px;border:1px solid #333d4b;border-radius:99px;background:#12161c;cursor:pointer;opacity:0;transform:translateY(6px);transition:opacity .3s,transform .3s,background .15s,border-color .15s}
+.reveal.open .chip{opacity:1;transform:none}.chip.sel{border-color:var(--acc);background:rgba(91,141,239,.18)}
+@media(prefers-reduced-motion:reduce){.reveal,.chip,.foldbody,.sw,.sw::after{transition:none!important}}
+/* wizard */
+#wiz{position:fixed;inset:0;background:var(--bg);z-index:20;overflow:auto}
+.steps{display:flex;margin:26px auto 0;max-width:820px;padding:0 12px}.st{flex:1;text-align:center;font-size:13px;color:var(--mut)}
+.st b{display:block;margin:0 auto 6px;width:30px;height:30px;border-radius:50%;line-height:30px;background:#222a35;color:var(--mut)}
+.st.on b{background:var(--acc);color:#fff}.st.done b{background:var(--ok);color:#06210f}.st.on{color:var(--ink)}
+.wiz{max-width:820px;margin:22px auto 40px}
+.dev{display:flex;align-items:center;gap:14px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;margin-top:10px;background:#12161c;cursor:pointer}
+.dev.sel{border-color:var(--acc);background:rgba(91,141,239,.08)}.dev .ic{width:42px;height:42px;border-radius:9px;background:#222a35;display:grid;place-items:center;font-size:20px;flex:none}
+.dev .t{flex:1;min-width:0}.dev .t div:first-child{font-weight:600}
+.wfoot{display:flex;justify-content:space-between;align-items:center;margin-top:22px;gap:12px;flex-wrap:wrap}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--mut);border-top-color:transparent;border-radius:50%;animation:sp 1s linear infinite;vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.live{display:flex;gap:26px;align-items:baseline;font:600 22px ui-monospace,Consolas,monospace;flex-wrap:wrap}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#222a35;border:1px solid #333d4b;padding:8px 16px;border-radius:8px;z-index:30}
 </style></head><body>
-<header><h1>ScoreReader</h1><span id="src" class="pill">…</span><span id="age" class="pill">…</span><span id="vmix" class="pill">vMix</span><span id="mqtt" class="pill">MQTT</span>
-<span class="mut" id="stats"></span><span style="flex:1"></span>
-<label class="mut">Sport <select id="sport"></select></label>
-<button onclick="reinit()" title="Re-run ScoreLinkII probe + config">Re-init bot</button>
-<button onclick="openSettings()">Settings</button>
-<a href="/data.json" target="_blank">data.json</a><a href="/data.xml" target="_blank">data.xml</a></header>
+<header><h1>ScoreReader</h1>
+ <nav class="tabs" id="tabs"><button data-t="home" class="on">Home</button><button data-t="teams">Teams</button><button data-t="diag">Diagnostics</button><button data-t="settings">Settings</button></nav>
+ <span style="flex:1"></span><span id="hstat" class="mut small"></span><span id="overall" class="pill">…</span></header>
 <div class="banner" id="demo" hidden><span id="demotxt"></span><button onclick="goLive()">Back to live data</button></div>
-<div id="settings" hidden onclick="if(event.target===this)closeSettings()"><div class="panel">
- <h2>Settings</h2><p class="mut" style="margin:0 0 12px">Saved to <span id="cfgpath"></span>. Demo and replay are never saved: ScoreReader always starts with live data.</p>
- <div id="setform"></div><datalist id="portlist"></datalist>
- <div class="setbar"><button class="primary" onclick="saveSettings()">Save</button><button onclick="closeSettings()">Close</button><span id="setmsg" class="mut"></span></div>
-</div></div>
+
 <main>
-<div class="card bug">
- <div><div class="team" id="hn">HOME</div><div class="tbar" id="hc"></div><div class="score" id="hs">0</div><div class="poss" id="hp"></div></div>
- <div class="mid"><div class="clock" id="clk">--:--</div><div class="sub" id="sub"></div></div>
- <div><div class="team" id="gn">GUEST</div><div class="tbar" id="gc"></div><div class="score" id="gs">0</div><div class="poss" id="gp"></div></div>
+<!-- ================= HOME ================= -->
+<section id="t-home">
+<div class="home">
+ <div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">Scoreboard in</h3><span class="dot" id="indot"></span></div>
+  <div style="font-weight:600;margin-top:10px" id="intitle">…</div><div class="mut small" id="indetail"></div>
+  <div class="row" style="margin-top:12px"><span class="mut">Console</span><span id="inconsole" style="text-align:right"></span></div>
+  <div class="row"><span class="mut">Sport</span><span id="insport"></span></div>
+  <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap"><button onclick="openSettings('input')">Change…</button><button onclick="openWizard(1)">Search again</button></div>
+ </div>
+
+ <div class="card game"><h3>Game now</h3>
+  <div class="gn">
+   <div><div class="tn"><span class="arrow" id="hp"></span><span id="hn">HOME</span><span class="arrow"></span></div><div class="cbar" id="hc"></div><div class="big" id="hs">0</div><div class="to" id="hto"></div><div class="mut small" id="htol"></div></div>
+   <div style="padding-top:8px"><div class="clock" id="clk">--:--</div><div style="font-size:18px;margin-top:6px" id="per"></div><div class="mut small" id="run"></div></div>
+   <div><div class="tn"><span class="arrow"></span><span id="gn">GUEST</span><span class="arrow" id="gp"></span></div><div class="cbar" id="gc"></div><div class="big" id="gs">0</div><div class="to" id="gto"></div><div class="mut small" id="gtol"></div></div>
+  </div>
+  <div class="stats" id="stats"></div>
+ </div>
+
+ <div class="stack">
+  <div class="card"><h3>vMix</h3>
+   <div class="row first"><span><span class="dot" id="xmldot"></span>&nbsp; Data source (XML)</span><span class="mut small" id="xmlage"></span></div>
+   <div class="copy"><span id="xmlurl"></span><b onclick="copyText(xmlurl.textContent)">Copy</b></div>
+   <div class="row" style="margin-top:10px"><span><span class="dot" id="stdot"></span>&nbsp; SetText push</span><button class="sw" id="stsw" onclick="toggle('vmix.enabled',this)" title="Push values into a vMix title over the TCP API"></button></div>
+   <div class="mut small" id="ststate"></div>
+  </div>
+  <div class="card">
+   <div class="fold" id="netfold" onclick="foldNet()" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+    <h3 style="margin:0">Network outputs</h3><span style="display:flex;align-items:center;gap:8px"><span class="dot" id="netdot"></span><span class="mut small" id="netsum"></span><span class="chev">▸</span></span></div>
+   <div class="foldbody" id="netbody"><div style="padding-top:12px">
+    <div class="row"><span><span class="dot" id="mqdot"></span>&nbsp; MQTT</span><span class="mut small" id="mqstate"></span></div>
+    <div class="copy" id="mqcopyrow"><span id="mqaddr"></span><b onclick="copyText(mqaddr.textContent)">Copy</b></div>
+    <div class="row" style="margin-top:8px"><span><span class="dot" id="jsdot"></span>&nbsp; JSON</span><span class="mut small mono" id="jsurl"></span></div>
+    <div class="row"><span><span class="dot" id="csdot"></span>&nbsp; CSV</span><span class="mut small mono" id="csurl"></span></div>
+    <div class="row"><span><span class="dot" id="whdot"></span>&nbsp; Webhook</span><button class="sw" id="whsw" onclick="toggleWebhook(this)"></button></div>
+    <div class="mut small" id="whstate"></div>
+    <div style="margin-top:10px"><a href="#" onclick="openSettings('network');return false">Network output settings →</a></div>
+   </div></div>
+  </div>
+ </div>
 </div>
-<div class="cols">
- <div class="card"><b>Fields</b> <span class="mut">(names = keys in data.json)</span>
-   <input id="flt" placeholder="filter…" style="float:right"><table id="ft"></table></div>
- <div class="card"><b id="ptitle">Raw data</b><div id="cltab"></div><div class="grid" id="grid"></div>
-   <br><b>Log</b><pre id="log"></pre><br><b>Last bytes (hex)</b><pre id="hex"></pre></div>
-</div></main>
+</section>
+
+<!-- ================= TEAMS ================= -->
+<section id="t-teams" hidden>
+<div class="teams">
+ <div class="card"><h3>Home</h3>
+  <label class="f"><span>Name</span><input id="tm_home_name" placeholder="from the console"></label>
+  <label class="f"><span>Abbreviation</span><input id="tm_home_abbr"></label>
+  <label class="f"><span>Colour</span><span class="colr"><input type="color" id="tm_home_pick" oninput="tm_home_color.value=this.value.toUpperCase()"><input id="tm_home_color" placeholder="#C8102E" oninput="syncPick('home')"></span></label>
+  <div class="mut small" style="margin-top:12px" id="tm_home_hint"></div></div>
+ <div style="display:grid;place-items:center;min-height:60px;padding-top:120px"><button onclick="swapTeams()" title="Swap home and guest">⇄</button></div>
+ <div class="card"><h3>Guest</h3>
+  <label class="f"><span>Name</span><input id="tm_guest_name" placeholder="from the console"></label>
+  <label class="f"><span>Abbreviation</span><input id="tm_guest_abbr"></label>
+  <label class="f"><span>Colour</span><span class="colr"><input type="color" id="tm_guest_pick" oninput="tm_guest_color.value=this.value.toUpperCase()"><input id="tm_guest_color" placeholder="#6B7A8F" oninput="syncPick('guest')"></span></label>
+  <div class="mut small" style="margin-top:12px" id="tm_guest_hint"></div></div>
+</div>
+<div class="card" style="display:flex;align-items:center;gap:12px;margin-top:18px;flex-wrap:wrap"><span class="mut">Changes apply live (no restart). Blank = what the console sends.</span><span style="flex:1"></span><span id="tmmsg" class="small"></span><button onclick="clearTeams()">Clear</button><button class="primary" onclick="saveTeams()">Save</button></div>
+</section>
+
+<!-- ================= DIAGNOSTICS ================= -->
+<section id="t-diag" hidden>
+<div class="two">
+ <div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px"><h3 style="margin:0">All fields</h3><input id="flt" placeholder="filter…" style="width:180px;padding:5px 9px"></div>
+  <div class="mut small" style="margin:6px 0 4px">Names = keys in data.json / data.xml</div><table id="ft"></table></div>
+ <div class="stack">
+  <div class="card"><h3 id="ptitle">Raw data</h3><div id="cltab"></div><div class="grid" id="grid"></div></div>
+  <div class="card"><h3>Tools</h3>
+   <div class="tools">
+    <button class="sm" id="recbtn" onclick="toggleRecord()">● Record raw bytes</button>
+    <button class="sm" onclick="replayPick()">Replay a capture…</button>
+    <button class="sm" onclick="postSettings({source:'demo'})">Demo game</button>
+    <button class="sm" onclick="reinit()" title="Re-run the ScoreLinkII probe and set-up">Re-init bot</button>
+   </div>
+   <div id="replaybox" hidden style="margin-top:10px;display:flex;gap:8px"><select id="replaysel"></select><button class="sm primary" onclick="startReplay()">Play</button></div>
+   <h3 style="margin-top:16px">Log</h3><pre id="log"></pre>
+   <div class="mut small" style="margin-top:10px">Last bytes (hex):</div><pre id="hex" class="mono" style="max-height:120px"></pre>
+   <div class="mut small" style="margin-top:10px"><a href="/data.json" target="_blank">data.json</a> · <a href="/data.xml" target="_blank">data.xml</a> · <a href="/data.csv" target="_blank">data.csv</a> · <a href="/api/state" target="_blank">api/state</a></div>
+  </div>
+ </div>
+</div>
+</section>
+
+<!-- ================= SETTINGS ================= -->
+<section id="t-settings" hidden>
+<div class="setwrap">
+ <div class="snav" id="snav"></div>
+ <div class="spane"><div id="setform"></div><datalist id="portlist"></datalist>
+  <div class="setbar"><button class="primary" onclick="saveSettings()">Save</button><span id="setmsg" class="mut"></span><button onclick="openWizard(1)">Run setup again</button></div>
+  <div class="mut small">Saved to <span id="cfgpath"></span>. Demo and replay are never saved: ScoreReader always starts with live data.</div>
+ </div>
+</div>
+</section>
+</main>
+
+<!-- ================= WIZARD ================= -->
+<div id="wiz" hidden>
+<header><h1>ScoreReader</h1><span class="mut">Setup</span><span style="flex:1"></span><button onclick="finishWizard(true)">Skip, I'll set it up myself</button></header>
+<div class="steps" id="wsteps"></div>
+<div class="wiz card" id="wbody"></div>
+</div>
+<div class="toast" id="toast" hidden></div>
+
 <script>
-let fieldsMeta=[];const H={'X-ScoreReader':'1'};
+const H={'X-ScoreReader':'1'};
+const $=id=>document.getElementById(id);
 const esc=v=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-async function reinit(){await fetch('/api/reinit',{method:'POST',headers:H});}
-document.getElementById('sport').onchange=async e=>{await fetch('/api/sport?name='+encodeURIComponent(e.target.value),{method:'POST',headers:H});fieldsMeta=[];};
-async function postSettings(ch){const r=await fetch('/api/settings',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(ch)});return r.json();}
-async function goLive(){await postSettings({source:window._live||'scorelink'});}
-const SRC={scorelink:'ScoreBot / ScoreLinkII (USB)',serial:'Serial cable to the console',tcp:'Network serial server (TCP)',
- demo:'Demo: simulated game (not saved)',replay:'Replay a capture (not saved)'};
-let S=null;
-async function openSettings(){S=await (await fetch('/api/settings')).json();renderSettings();document.getElementById('settings').hidden=false;}
-function closeSettings(){document.getElementById('settings').hidden=true;}
+const truthy=v=>v===true||v==='1'||v===1||v==='true';
+let ST=null,S=null,TAB='home';
+function toast(t){const e=$('toast');e.textContent=t;e.hidden=false;clearTimeout(e._t);e._t=setTimeout(()=>e.hidden=true,2200);}
+function copyText(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast('Copied'),()=>{const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();try{document.execCommand('copy');toast('Copied')}catch(e){}a.remove();});}
+async function postSettings(ch){const r=await fetch('/api/settings',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(ch)});const j=await r.json();if(!j.ok)toast(Object.values(j.errors||{}).join(' · ')||'Not saved');S=null;return j;}
+async function getSettings(){S=await (await fetch('/api/settings')).json();return S;}
+async function reinit(){await fetch('/api/reinit',{method:'POST',headers:H});toast('Re-init requested');}
+async function goLive(){await postSettings({source:ST&&ST.live_source||'scorelink'});}
+function lsGet(k){try{return localStorage.getItem(k)}catch(e){return null}}function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+
+/* ---------- tabs ---------- */
+function showTab(t){TAB=t;document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t==t));
+ ['home','teams','diag','settings'].forEach(x=>$('t-'+x).hidden=x!=t);
+ if(t=='teams')loadTeams();if(t=='settings')loadSettings();lsSet('sr_tab',t);}
+$('tabs').onclick=e=>{const b=e.target.closest('button');if(b)showTab(b.dataset.t);};
+
+/* ---------- home ---------- */
+const SRCNAME={scorelink:'Sportzcast ScoreBot (USB)',serial:'Serial / USB',tcp:'Network',demo:'Demo game',replay:'Replay'};
+function inputTitle(s){if(s.source=='tcp'){const h=s.tcp.host||'';return (s.tcp.port==10001||/scorebridge/i.test(h)?'ScoreBridge · ':'Network · ')+h;}
+ if(s.source=='serial')return 'Serial · '+(s.port||'auto');return SRCNAME[s.source]||s.source;}
+function ageTxt(a){if(a==null)return 'not read yet';if(a<2)return 'read just now';if(a<90)return 'read '+Math.round(a)+' s ago';if(a<5400)return 'read '+Math.round(a/60)+' min ago';return 'not read lately';}
+function readDot(a){return a==null?'':(a<15?'g':'y');}
+function setDot(id,c){$(id).className='dot'+(c?' '+c:'');}
+const BOXES=[
+ {k:'down_distance',l:'Down & distance'},{k:'ball_on',l:'Ball on'},{k:'play_clock',l:'Play clock'},{k:'shot_clock',l:'Shot clock'},
+ {k:'timeout_clock',l:'Timeout clock'},
+ {f:d=>d.balls!==undefined&&(d.balls+d.strikes+d.outs)!==''?`${d.balls||0}-${d.strikes||0}-${d.outs||0}`:null,l:'Balls-Strikes-Outs'},
+ {p:'shots',l:'Shots'},{p:'corners',l:'Corners'},{p:'saves',l:'Saves'},{p:'fouls',l:'Fouls'},{p:'hits',l:'Hits'},{p:'errors',l:'Errors'},{p:'penalties',l:'Penalties'},
+ {f:d=>'home_bonus' in d?(truthy(d.home_double_bonus)||truthy(d.guest_double_bonus)?'Double ':'')+([truthy(d.home_bonus)?abbr(d,'home'):'',truthy(d.guest_bonus)?abbr(d,'guest'):''].filter(Boolean).join(' · ')||'—'):null,l:'Bonus'},
+ {f:d=>'possession' in d&&'down_distance' in d?(d.possession=='H'?abbr(d,'home'):d.possession=='V'?abbr(d,'guest'):'—'):null,l:'Possession'},
+];
+function abbr(d,s){return d[s+'_abbr']||d[s+'_name']||s.toUpperCase();}
+function timeouts(el,lab,v,max){const n=parseInt(v,10);if(isNaN(n)){el.innerHTML='';$(lab).textContent=v?v+' timeouts':'';return;}
+ el.innerHTML=Array.from({length:Math.max(n,max)},(_,i)=>`<i class="${i<n?'':'u'}"></i>`).join('');$(lab).textContent=n+' timeout'+(n==1?'':'s');}
+function renderGame(d){
+ $('hn').textContent=d.home_name||'HOME';$('gn').textContent=d.guest_name||'GUEST';
+ $('hc').style.background=d.home_color||'';$('gc').style.background=d.guest_color||'';
+ $('hs').textContent=d.home_score??'0';$('gs').textContent=d.guest_score??'0';
+ $('hp').textContent=truthy(d.home_poss)?'◀':'';$('gp').textContent=truthy(d.guest_poss)?'▶':'';
+ $('clk').textContent=d.clock||'--:--';
+ const pt=d.period_text&&!/^\d+$/.test(d.period_text)?d.period_text:'';
+ $('per').textContent=pt||(d.period_ordinal?d.period_ordinal+({football:' quarter',basketball:'',soccer:' half'}[d.sport]||''):'');
+ $('run').innerHTML='clock_running' in d?(truthy(d.clock_running)?'clock running <span class="dot g" style="width:8px;height:8px"></span>':'clock stopped'):'';
+ const mx=Math.max(parseInt(d.home_timeouts)||0,parseInt(d.guest_timeouts)||0,3);
+ timeouts($('hto'),'htol',d.home_timeouts,mx);timeouts($('gto'),'gtol',d.guest_timeouts,mx);
+ let h='';for(const b of BOXES){let v=null;
+  if(b.k){if(b.k in d&&String(d[b.k]).trim()!=='')v=d[b.k];}
+  else if(b.p){const a=d['home_'+b.p],c=d['guest_'+b.p];if((a??'')!==''||(c??'')!=='')v=`${a||0} – ${c||0}`;}
+  else v=b.f(d);
+  if(v!=null)h+=`<div class="stat"><div class="v" title="${esc(v)}">${esc(v)}</div><div class="k">${b.l}</div></div>`;}
+ $('stats').innerHTML=h;}
+function renderHome(s){
+ const o=s.outputs,base=`http://${o.lan_ip}:${o.http_port}`;
+ const age=s.packet_age,live=s.source_state=='connected'&&age!=null&&age<10;
+ setDot('indot',s.source_state=='error'?'r':live?'g':'y');
+ $('intitle').textContent=inputTitle(s);
+ $('indetail').textContent=s.source_state=='error'?s.source_detail:(s.source_state+(age!=null?' · last data '+(age<1?age.toFixed(1):Math.round(age))+' s ago':' · no data yet'));
+ $('inconsole').textContent=s.cl_table&&s.cl_table.length&&!s.vendor_mode?'Daktronics (current loop)':s.vendor_mode?s.scoreboard:(s.packets?'Daktronics (RTD)':'—');
+ $('insport').textContent=(s.data.sport||s.sport||'')+(s.vendor_mode?'':' (auto)');
+ renderGame(s.data);
+ $('xmlurl').textContent=base+'/data.xml';$('xmlage').textContent=ageTxt(o.xml.age);setDot('xmldot',readDot(o.xml.age));
+ $('stsw').classList.toggle('on',o.vmix.enabled);
+ setDot('stdot',!o.vmix.enabled?'':o.vmix.state.startsWith('connected')?'g':'r');
+ $('ststate').textContent=o.vmix.enabled?`${o.vmix.state} · input "${o.vmix.input}"`:'';
+ // network outputs
+ const m=o.mqtt;const mqc=!m.enabled?'':m.state.startsWith('error')?'r':(m.state.startsWith('listening')||m.state.startsWith('connected'))?'g':'y';
+ setDot('mqdot',mqc);
+ $('mqstate').textContent=!m.enabled?(m.configured?'on after a restart':'off'):(m.clients+' client'+(m.clients==1?'':'s'));
+ $('mqcopyrow').hidden=!m.enabled;
+ $('mqaddr').textContent=m.mode=='client'?`→ ${m.broker_host}:${m.broker_port} · bot ${m.bot}`:`${o.lan_ip}:${m.tcp_port}${m.ws_port?' · ws :'+m.ws_port:''} · bot ${m.bot}`;
+ const ja=Math.min(o.json.age??1e9,o.json_obj.age??1e9);const jage=ja==1e9?null:ja;
+ setDot('jsdot',readDot(jage));setDot('csdot',readDot(o.csv.age));
+ $('jsurl').textContent=':'+o.http_port+'/data.json';$('csurl').textContent=':'+o.http_port+'/data.csv';
+ $('jsurl').title=ageTxt(jage);$('csurl').title=ageTxt(o.csv.age);
+ const w=o.webhook;$('whsw').classList.toggle('on',w.enabled);setDot('whdot',!w.enabled?'':w.state.startsWith('error')?'r':w.state.startsWith('ok')?'g':'y');
+ $('whstate').textContent=w.enabled?w.state:'';
+ const on=[m.enabled&&'MQTT',jage!=null&&'JSON',o.csv.age!=null&&'CSV',w.enabled&&'Webhook'].filter(Boolean);
+ $('netsum').textContent=on.length?on.join(' · '):'none in use';
+ const bad=(m.enabled&&mqc=='r')||(w.enabled&&w.state.startsWith('error'));
+ setDot('netdot',bad?'r':on.length?'g':'');
+ // header
+ const problems=[s.source_state=='error'&&'scoreboard',!live&&s.source_state!='error'&&'no data',o.vmix.enabled&&!o.vmix.state.startsWith('connected')&&'vMix',bad&&'network output'].filter(Boolean);
+ const ov=$('overall');ov.textContent=problems.length?'Check: '+problems.join(', '):'All good';ov.className='pill '+(problems.length?(s.source_state=='error'?'badb':'warnb'):'okb');
+}
+function foldNet(open){const f=$('netfold'),b=$('netbody');const o=open??!b.classList.contains('open');b.classList.toggle('open',o);f.classList.toggle('open',o);lsSet('sr_net',o?'1':'0');}
+async function toggle(path,btn){const on=!btn.classList.contains('on');btn.classList.toggle('on',on);await postSettings({[path]:on});}
+async function toggleWebhook(btn){const on=!btn.classList.contains('on');
+ if(on&&!(S||await getSettings()).values['webhook.url']){toast('Set the webhook URL first');openSettings('network');return;}
+ await toggle('webhook.enabled',btn);}
+
+/* ---------- teams ---------- */
+const TM=['home_name','home_abbr','home_color','guest_name','guest_abbr','guest_color'];
+async function loadTeams(){await getSettings();TM.forEach(k=>$('tm_'+k).value=S.values['teams.'+k]||'');syncPick('home');syncPick('guest');$('tmmsg').textContent='';
+ const d=ST&&ST.data||{};}
+function syncPick(side){const v=$('tm_'+side+'_color').value;if(/^#[0-9a-f]{6}$/i.test(v))$('tm_'+side+'_pick').value=v;}
+function swapTeams(){for(const k of ['name','abbr','color']){const a=$('tm_home_'+k),b=$('tm_guest_'+k);[a.value,b.value]=[b.value,a.value];}syncPick('home');syncPick('guest');$('tmmsg').textContent='Swapped: press Save';}
+function clearTeams(){TM.forEach(k=>$('tm_'+k).value='');$('tmmsg').textContent='Cleared: press Save';}
+async function saveTeams(){const ch={};TM.forEach(k=>ch['teams.'+k]=$('tm_'+k).value.trim());const r=await postSettings(ch);
+ $('tmmsg').className='small '+(r.ok?'ok':'bad');$('tmmsg').textContent=r.ok?'Saved':Object.values(r.errors).join(' · ');}
+
+/* ---------- diagnostics ---------- */
+function renderDiag(s){
+ const d=s.data,f=$('flt').value.toLowerCase(),meta={};s.fields.forEach(m=>meta[m.name]=m);
+ let h='<tr><th>key</th><th>value</th><th>from</th></tr>';
+ for(const [k,v] of Object.entries(d)){if(f&&!k.includes(f))continue;const m=meta[k];if(m&&(v===''||v===false)&&!f)continue;
+  h+=`<tr><td>${esc(k)}</td><td class="v">${esc(v)}</td><td class="mut">${m?'pos '+m.pos+'+'+m.len:'derived'}</td></tr>`;}
+ $('ft').innerHTML=h;
+ if(s.contract&&s.contract.length){$('grid').innerHTML='';$('ptitle').textContent=s.protocol+' · decoded fields';
+  $('cltab').innerHTML='<table><tr><th>field</th><th>value</th></tr>'+s.contract.map(r=>`<tr><td>${esc(r.k)}</td><td class="v">${esc(r.v).replace(/ /g,'·')}</td></tr>`).join('')+'</table>';}
+ else if(s.cl_table.length){$('grid').innerHTML='';$('ptitle').textContent=s.protocol+' · console addresses';
+  let t='<div class="mut small" style="margin-bottom:6px">Blue = changed in the last second</div><table><tr><th>addr</th><th>len</th><th>7-seg digits</th><th>age</th><th>hex</th></tr>';
+  s.cl_table.filter(r=>r.addr<0xE0).forEach(r=>{t+=`<tr><td>${r.addr}</td><td>${r.len}</td><td class="v" style="${r.age<1?'background:rgba(91,141,239,.3)':''}">${esc(r.digits).replace(/ /g,'·')}</td><td class="mut">${r.age}s</td><td class="mut v" style="font-size:11px">${esc(r.hex)}</td></tr>`});
+  $('cltab').innerHTML=t+'</table>';}
+ else{$('cltab').innerHTML='';$('ptitle').textContent='Raw RTD buffer (1-based positions; blue = just changed)';
+  const raw=s.raw,ch=s.changed_ago,W=50;let last=0,g='';for(let i=0;i<raw.length;i++)if(raw[i]!=' ')last=i;
+  for(let r=0;r<=last;r+=W){g+=`<div class="r"><span class="n">${r+1}</span>`;
+   for(let i=r;i<Math.min(r+W,raw.length);i++){const a=ch[i],cls=a<1?'hot':(a<10?'warm':'');const c=raw[i]==' '?'&nbsp;':esc(raw[i]);g+=`<span class="c ${cls}" title="pos ${i+1}">${c}</span>`;}g+='</div>';}
+  $('grid').innerHTML=g;}
+ const lg=$('log'),atEnd=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-20;lg.textContent=s.logs.slice(-80).join('\n');if(atEnd)lg.scrollTop=1e9;
+ $('hex').textContent=s.recent_hex;
+ const rb=$('recbtn');rb.textContent=s.record_raw?'■ Stop recording raw bytes':'● Record raw bytes';rb.classList.toggle('primary',s.record_raw);
+}
+async function toggleRecord(){await postSettings({record_raw:!ST.record_raw});}
+async function replayPick(){await getSettings();const c=S.choices.replay_file||[];const b=$('replaybox');
+ if(!c.length){toast('No captures in logs/ yet: turn on Record raw bytes first');return;}
+ $('replaysel').innerHTML=c.map(x=>`<option>${esc(x)}</option>`).join('');b.hidden=!b.hidden;}
+async function startReplay(){await postSettings({source:'replay',replay_file:$('replaysel').value});$('replaybox').hidden=true;}
+
+/* ---------- settings ---------- */
+const SECTIONS=[['input','Scoreboard input',['Data source','Scoreboard']],['vmix','vMix',['vMix']],['network','Network outputs',['MQTT','Webhook']],['files','Files',['Files']],['advanced','Advanced',['Advanced']]];
+const SRC={scorelink:'ScoreBot / ScoreLinkII (USB)',serial:'Serial or USB (incl. ScoreBridge on USB, 115200)',tcp:'Network (ScoreBridge, serial server)',demo:'Demo: simulated game (not saved)',replay:'Replay a capture (not saved)'};
+const SHOW={port:['scorelink','serial'],baud:['scorelink','serial'],'scorelink.probe_on_start':['scorelink'],'scorelink.send_config_on_start':['scorelink'],'tcp.host':['tcp'],'tcp.port':['tcp'],replay_file:['replay']};
+const HIDE=new Set(['setup_done','output_all_fields']);let SEC=lsGet('sr_sec')||'input';
 function sid(p){return 'set_'+p.replace(/\./g,'_');}
+function openSettings(sec){if(sec){SEC=sec;lsSet('sr_sec',sec);}showTab('settings');}
 function brandOf(pid){for(const b of S.scoreboards)if(b.sports.some(x=>x.id==pid))return b;return null;}
 function sbPicker(){const pid=S.values['scoreboard.protocol']||'',b=brandOf(pid);
- let h=`<label class="set"><span>Scoreboard brand</span><select id="sb_brand" onchange="sbBrand()"><option value="">Daktronics All Sport 5000 (built-in, automatic)</option>`+
-  S.scoreboards.map(x=>`<option ${b&&b.name==x.name?'selected':''}>${esc(x.name)}</option>`).join('')+'</select></label>';
- h+=`<label class="set" id="sb_sport_l"><span>Sport / console layout</span><select id="${sid('scoreboard.protocol')}" onchange="showFor()"></select></label>`;
- h+=`<label class="set" id="sb_conn_l"><span>Wiring</span><select id="${sid('scoreboard.connection')}"></select></label>`;return h;}
-function sbBrand(keep){const bn=document.getElementById('sb_brand').value,b=S.scoreboards.find(x=>x.name==bn);
- const sp=document.getElementById(sid('scoreboard.protocol')),cn=document.getElementById(sid('scoreboard.connection'));
+ return `<label class="set"><span>Scoreboard brand</span><select id="sb_brand" onchange="sbBrand()"><option value="">Daktronics All Sport 5000 (detects the sport itself)</option>`+
+  S.scoreboards.map(x=>`<option ${b&&b.name==x.name?'selected':''}>${esc(x.name)}</option>`).join('')+'</select></label>'+
+  `<div class="reveal" id="sb_rv"><div><label class="set"><span>Sport / console layout</span><select id="${sid('scoreboard.protocol')}"></select></label>`+
+  `<label class="set" id="sb_conn_l"><span>Wiring</span><select id="${sid('scoreboard.connection')}"></select></label></div></div>`;}
+function sbBrand(keep){const bn=$('sb_brand').value,b=S.scoreboards.find(x=>x.name==bn);
+ const sp=$(sid('scoreboard.protocol')),cn=$(sid('scoreboard.connection'));
  sp.innerHTML=b?b.sports.map(x=>`<option value="${esc(x.id)}">${esc(x.description)}</option>`).join(''):'<option value=""></option>';
  cn.innerHTML=b?b.connections.map((c,i)=>`<option value="${i}">${esc(c)}</option>`).join(''):'<option value="0"></option>';
  if(keep){sp.value=S.values['scoreboard.protocol']||'';cn.value=String(S.values['scoreboard.connection']||0);}
- document.getElementById('sb_sport_l').hidden=!b;document.getElementById('sb_conn_l').hidden=!b||b.connections.length<2;showFor();}
+ $('sb_rv').classList.toggle('open',!!b);$('sb_conn_l').hidden=!b||b.connections.length<2;showFor();}
 function inputFor(sp){const v=S.values[sp.path],id=sid(sp.path);
  if(sp.type=='bool')return `<input type="checkbox" id="${id}" ${v?'checked':''}>`;
  if(sp.type=='choice'){const ch=S.choices[sp.path]||[];if(!ch.length)return '<span class="mut">none yet</span>';
-  return `<select id="${id}">`+ch.map(c=>`<option value="${esc(c)}" ${c==v?'selected':''}>${esc(sp.path=='source'?(SRC[c]||c):c)}</option>`).join('')+'</select>';}
+  return `<select id="${id}">`+ch.map(c=>`<option value="${esc(c)}" ${c==v?'selected':''}>${esc(sp.path=='source'?(SRC[c]||c):(sp.path=='mqtt.mode'?{broker:'Built-in broker (others connect to this computer)',client:'Publish to another broker'}[c]||c:c))}</option>`).join('')+'</select>';}
  if(sp.type=='color')return `<span class="colr"><input type="color" value="${esc(v||'#000000')}" oninput="${id}.value=this.value.toUpperCase()"><input id="${id}" value="${esc(v)}" placeholder="#1E3A8A"></span>`;
- return `<input id="${id}" value="${esc(v)}"${sp.path=='port'?' list="portlist"':''}${sp.type=='int'||sp.type=='port'?' inputmode="numeric"':''}>`;}
-const SHOW={port:['scorelink','serial'],baud:['scorelink','serial'],'scorelink.probe_on_start':['scorelink'],
- 'scorelink.send_config_on_start':['scorelink'],'tcp.host':['tcp'],'tcp.port':['tcp'],replay_file:['replay']};
-function renderSettings(){const groups={};S.spec.forEach(sp=>(groups[sp.group]=groups[sp.group]||[]).push(sp));let h='';
- for(const [g,list] of Object.entries(groups)){h+=`<fieldset><legend>${esc(g)}</legend>`;
-  list.forEach(sp=>{if(sp.path=='scoreboard.protocol'){h+=sbPicker();return;}if(sp.path=='scoreboard.connection')return;
-   h+=`<label class="set" data-path="${sp.path}"><span>${esc(sp.label)}${sp.apply=='restart'?' <em class="mut">(after restart)</em>':''}</span>${inputFor(sp)}</label>`});
-  if(g=='Files')h+=`<p class="mut" style="margin:4px 0">Text files go to ${esc(S.text_folder)}</p>`;h+='</fieldset>';}
- setform.innerHTML=h;cfgpath.textContent=S.config_path;setmsg.textContent='';setmsg.className='mut';
- portlist.innerHTML='<option value="auto">auto-detect</option>'+S.ports.map(p=>`<option value="${esc(p.device)}">${esc(p.description)}${p.scorelink?' (ScoreBot)':''}</option>`).join('');
- const src=document.getElementById(sid('source'));if(src){src.onchange=showFor;}sbBrand(true);}
-function showFor(){const src=(document.getElementById(sid('source'))||{}).value,bp=document.getElementById('sb_brand');
- document.querySelectorAll('label.set[data-path]').forEach(l=>{const w=SHOW[l.dataset.path];l.hidden=(!!w&&!w.includes(src))||(l.dataset.path=='sport'&&bp&&bp.value!='');});}
+ return `<input id="${id}" value="${esc(v)}"${sp.path=='port'?' list="portlist"':''}${sp.type=='int'||sp.type=='port'?' inputmode="numeric"':''}${sp.type=='url'?' placeholder="http://…"':''}>`;}
+function setRow(sp){return `<label class="set" data-path="${sp.path}"><span>${esc(sp.label)}${sp.apply=='restart'?' <em class="mut small">(after restart)</em>':''}</span>${inputFor(sp)}</label>`;}
+async function loadSettings(){await getSettings();renderSettings();}
+function renderSettings(){
+ $('snav').innerHTML=SECTIONS.map(([k,l])=>`<button data-s="${k}" class="${k==SEC?'on':''}">${l}</button>`).join('');
+ $('snav').onclick=e=>{const b=e.target.closest('button');if(!b)return;SEC=b.dataset.s;lsSet('sr_sec',SEC);document.querySelectorAll('#snav button').forEach(x=>x.classList.toggle('on',x==b));document.querySelectorAll('.spn').forEach(p=>p.hidden=p.dataset.s!=SEC);};
+ const by={};S.spec.forEach(sp=>(by[sp.group]=by[sp.group]||[]).push(sp));
+ const base=`http://${(ST&&ST.outputs.lan_ip)||location.hostname}:${S.values.http_port}`;
+ let h='';
+ for(const [k,l,groups] of SECTIONS){h+=`<div class="spn" data-s="${k}" ${k==SEC?'':'hidden'}><h2>${l}</h2>`;
+  if(k=='input')h+='<div class="mut">Where the scoreboard data comes from. <a href="#" onclick="openWizard(1);return false">Search for devices</a></div>';
+  if(k=='vmix')h+=`<div class="mut">vMix reads the score as a Data Source: Data Sources → Add → XML →</div><div class="copy" style="max-width:520px"><span>${esc(base)}/data.xml</span><b onclick="copyText('${esc(base)}/data.xml')">Copy</b></div>`;
+  if(k=='network')h+='<div class="mut">Other apps that read the score over the network. vMix has its own section.</div>';
+  for(const g of groups){const list=(by[g]||[]).filter(sp=>!HIDE.has(sp.path));if(!list.length)continue;
+   h+=`<fieldset><legend>${esc(g=='Data source'?'Source':g)}</legend>`;
+   if(g=='MQTT')h+='<div class="mut small">ScoreConnect-compatible. OpenStatsEngine, and anything that used ScoreConnect, reads this.</div>';
+   list.forEach(sp=>{if(sp.path=='scoreboard.protocol'){h+=sbPicker();return;}if(sp.path=='scoreboard.connection')return;h+=setRow(sp);});
+   if(g=='Files')h+=`<p class="mut small" style="margin:4px 0">Text files go to ${esc(S.text_folder)}</p>`;
+   h+='</fieldset>';
+   if(g=='MQTT'){const oa=S.spec.find(x=>x.path=='output_all_fields');
+    h+=`<fieldset><legend>JSON / CSV</legend><div class="mut small">Always on.</div><div class="copy" style="max-width:520px"><span>${esc(base)}/data.json</span><b onclick="copyText('${esc(base)}/data.json')">Copy</b></div><div class="copy" style="max-width:520px"><span>${esc(base)}/data.csv</span><b onclick="copyText('${esc(base)}/data.csv')">Copy</b></div>${oa?setRow(oa):''}</fieldset>`;}
+  }
+  h+='</div>';}
+ $('setform').innerHTML=h;$('cfgpath').textContent=S.config_path;$('setmsg').textContent='';$('setmsg').className='mut';
+ $('portlist').innerHTML='<option value="auto">auto-detect</option>'+S.ports.map(p=>`<option value="${esc(p.device)}">${esc(p.description)}${p.scorelink?' (ScoreBot)':''}</option>`).join('');
+ const src=$(sid('source'));if(src)src.onchange=showFor;const mm=$(sid('mqtt.mode'));if(mm)mm.onchange=showFor;sbBrand(true);}
+const MQSHOW={'mqtt.tcp_port':'broker','mqtt.ws_port':'broker','mqtt.broker_host':'client','mqtt.broker_port':'client'};
+function showFor(){const src=($(sid('source'))||{}).value,bp=$('sb_brand'),mm=($(sid('mqtt.mode'))||{}).value;
+ document.querySelectorAll('label.set[data-path]').forEach(l=>{const p=l.dataset.path,w=SHOW[p];l.hidden=(!!w&&!w.includes(src))||(p=='sport'&&bp&&bp.value!='')||(MQSHOW[p]&&MQSHOW[p]!=mm);});}
 async function saveSettings(){const ch={};
- S.spec.forEach(sp=>{const el=document.getElementById(sid(sp.path));if(!el)return;const lab=el.closest('label');if(lab&&lab.hidden&&sp.path!='source'&&sp.path!='scoreboard.protocol')return;
-  let v=sp.type=='bool'?el.checked:el.value;if(sp.path=='scoreboard.protocol'&&document.getElementById('sb_brand').value=='')v='';
+ S.spec.forEach(sp=>{const el=$(sid(sp.path));if(!el)return;const lab=el.closest('label');if(lab&&lab.hidden&&sp.path!='source'&&sp.path!='scoreboard.protocol')return;
+  let v=sp.type=='bool'?el.checked:el.value;if(sp.path=='scoreboard.protocol'&&$('sb_brand').value=='')v='';
   if(String(v)!==String(S.values[sp.path]??''))ch[sp.path]=v;});
- if(!Object.keys(ch).length){setmsg.textContent='Nothing changed.';return;}
+ if(!Object.keys(ch).length){$('setmsg').textContent='Nothing changed.';return;}
  const r=await postSettings(ch);
- if(!r.ok){setmsg.className='bad';setmsg.textContent=Object.values(r.errors).join(' · ');return;}
- S=await (await fetch('/api/settings')).json();renderSettings();
- setmsg.className='';setmsg.textContent='Saved.'+(r.restart_needed.length?' Restart ScoreReader to apply: '+r.restart_needed.join(', '):'');}
-async function tick(){
- try{
-  const r=await fetch('/api/state');const s=await r.json();
-  const sel=document.getElementById('sport');
-  if(!sel.options.length){s.sports.forEach(n=>{const o=new Option(n,n);sel.add(o)});}
-  sel.value=s.sport;sel.parentElement.style.display=s.vendor_mode?'none':'';
-  const src=document.getElementById('src');src.textContent=s.source_state+' — '+s.source_detail;
-  src.className='pill '+(s.source_state=='connected'?'ok':(s.source_state=='error'?'bad':'warn'));
-  const age=document.getElementById('age');
-  if(s.packet_age==null){age.textContent='no packets yet';age.className='pill warn'}
-  else{age.textContent='last packet '+s.packet_age.toFixed(1)+'s ago';age.className='pill '+(s.packet_age<5?'ok':'warn')}
-  const vm=document.getElementById('vmix');vm.textContent='vMix: '+s.vmix_state;vm.className='pill '+(s.vmix_state.startsWith('connected')?'ok':(s.vmix_state=='disabled'?'':'bad'));
-  const mq=document.getElementById('mqtt');mq.textContent='MQTT: '+s.mqtt_state;mq.className='pill '+(s.mqtt_state.startsWith('listening')||s.mqtt_state.startsWith('connected')?'ok':(s.mqtt_state=='disabled'?'':'bad'));
-  document.getElementById('stats').textContent=`${s.bytes_in} bytes · ${s.packets} pkts · ${s.bad_packets} bad`+(Object.keys(s.unknown_headers).length?' · unknown hdrs: '+JSON.stringify(s.unknown_headers):'');
-  window._live=s.live_source;const dm=document.getElementById('demo');dm.hidden=s.source_saved;
-  if(!s.source_saved)demotxt.textContent=s.source=='demo'?'DEMO MODE: simulated game, not the scoreboard':'REPLAY: playing back '+(s.replay_file||'a capture')+', not live data';
-  const d=s.data;
-  hc.style.background=d.home_color||'transparent';gc.style.background=d.guest_color||'transparent';
-  hn.textContent=d.home_name||'HOME';gn.textContent=d.guest_name||'GUEST';hs.textContent=d.home_score;gs.textContent=d.guest_score;
-  hp.textContent=d.home_poss?'◀ POSS':'';gp.textContent=d.guest_poss?'POSS ▶':'';
-  clk.textContent=d.clock||'--:--';
-  let sub=[d.period_ordinal];if(d.play_clock!==undefined)sub.push('Play '+d.play_clock);if(d.shot_clock!==undefined)sub.push('Shot '+d.shot_clock);
-  if(d.down_distance)sub.push(d.down_distance+(d.ball_on?' · ball on '+d.ball_on:''));if(d.balls!==undefined)sub.push(`B${d.balls} S${d.strikes} O${d.outs}`);
-  if(d.home_shots!==undefined)sub.push(`SOG ${d.home_shots||0}-${d.guest_shots||0}`);if(d.home_corners!==undefined)sub.push(`CK ${d.home_corners||0}-${d.guest_corners||0}`);
-  document.getElementById('sub').textContent=sub.filter(Boolean).join('  ·  ');
-  const f=document.getElementById('flt').value.toLowerCase();
-  let h='<tr><th>key</th><th>value</th><th>pos</th></tr>';
-  const meta={};s.fields.forEach(m=>meta[m.name]=m);
-  for(const [k,v] of Object.entries(d)){ if(f&&!k.includes(f))continue; const m=meta[k];
-   if(m && (v===''||v===false) && !f)continue;
-   h+=`<tr><td>${k}</td><td class="v">${String(v).replace(/</g,'&lt;')}</td><td class="mut">${m?m.pos+'+'+m.len:'derived'}</td></tr>`;}
-  ft.innerHTML=h;
-  const raw=s.raw, ch=s.changed_ago;let g='';const W=50;let last=0;
-  for(let i=0;i<raw.length;i++)if(raw[i]!=' ')last=i;
-  for(let r=0;r<=last;r+=W){g+=`<div class="row"><span class="n">${r+1}</span>`;
-   for(let i=r;i<Math.min(r+W,raw.length);i++){const a=ch[i];const cls=a<1?'hot':(a<10?'warm':'');
-    const c=raw[i]==' '?'&nbsp;':raw[i].replace('&','&amp;').replace('<','&lt;');g+=`<span class="c ${cls}" title="pos ${i+1}">${c}</span>`;}
-   g+='</div>';}
-  if(s.contract&&s.contract.length){grid.innerHTML='';document.getElementById('ptitle').textContent=s.protocol+' — decoded fields';
-   cltab.innerHTML='<table><tr><th>field</th><th>value</th></tr>'+s.contract.map(r=>`<tr><td>${esc(r.k)}</td><td class="v">${esc(r.v).replace(/ /g,'·')}</td></tr>`).join('')+'</table>';}
-  else if(s.cl_table.length){grid.innerHTML='';document.getElementById('ptitle').textContent=s.protocol+' — addresses';
-   let t='<table><tr><th>addr</th><th>len</th><th>7-seg digits</th><th>age</th><th>hex (byte 0, 1, 2 …)</th></tr>';
-   s.cl_table.filter(r=>r.addr<0xE0).forEach(r=>{t+=`<tr><td>${r.addr}</td><td>${r.len}</td><td class="v">${r.digits.replace(/ /g,'·')}</td><td class="mut">${r.age}s</td><td class="mut v" style="font-size:11px">${r.hex}</td></tr>`});
-   cltab.innerHTML=t+'</table><br>';}
-  else{cltab.innerHTML='';document.getElementById('ptitle').textContent='Raw RTD buffer (1-based positions; blue = just changed)';grid.innerHTML=g;}
-  log.textContent=s.logs.slice(-60).join('\n');log.scrollTop=1e9;
-  document.getElementById('hex').textContent=s.recent_hex;
- }catch(e){document.getElementById('src').textContent='dashboard lost connection';}
+ if(!r.ok){$('setmsg').className='bad';$('setmsg').textContent=Object.values(r.errors).join(' · ');return;}
+ await getSettings();renderSettings();
+ $('setmsg').className='ok';$('setmsg').textContent='Saved.'+(r.restart_needed.length?' Restart ScoreReader to apply: '+r.restart_needed.join(', '):'');}
+
+/* ---------- setup wizard ---------- */
+const WSTEPS=['Connect','Scoreboard','vMix','Network outputs','Done'];let W={step:1,devs:null,sel:null,other:false};
+async function openWizard(step){W={step:step||1,devs:null,sel:null,other:false,brand:null,proto:'',conn:0};await getSettings();$('wiz').hidden=false;wRender();if(W.step==1)wSearch();}
+async function finishWizard(skip){await postSettings({setup_done:true});$('wiz').hidden=true;if(!skip)showTab('home');}
+function wGo(n){W.step=n;wRender();}
+function wSteps(){$('wsteps').innerHTML=WSTEPS.map((t,i)=>`<div class="st ${i+1<W.step?'done':i+1==W.step?'on':''}"><b>${i+1<W.step?'✓':i+1}</b>${t}</div>`).join('');}
+async function wSearch(){W.devs=null;W.sel=null;wRender();
+ try{W.devs=(await (await fetch('/api/discover')).json()).devices;}catch(e){W.devs=[];}
+ if(W.devs.length&&W.sel==null)W.sel=0;if(W.step==1)wRender();}
+const ICON={scorebridge:'⇄',scorebridge_usb:'⌁',scorelink:'⌁',serial:'⌁'};
+function wRender(){wSteps();const b=$('wbody');const s=W.step;
+ if(s==1){const d=W.devs;
+  let h=`<h2>Where does the scoreboard data come from?</h2><div class="mut">`+(d==null?'<span class="spin"></span> Looking on the network and USB…':`${d.length?'<span class="ok">'+d.length+' found</span>':'Nothing found'} &nbsp;<button class="sm" onclick="wSearch()">Search again</button>`)+'</div>';
+  (d||[]).forEach((x,i)=>{h+=`<div class="dev ${W.sel===i&&!W.other?'sel':''}" onclick="W.sel=${i};W.other=false;wRender()"><div class="ic">${ICON[x.kind]||'⌁'}</div><div class="t"><div>${esc(x.title)}</div><div class="mut small">${esc(x.detail)}${x.receiving?'':''}</div></div>${i==0&&x.kind=='scorebridge'&&x.receiving?'<span class="pill okb">Recommended</span>':''}</div>`;});
+  h+=`<div class="dev ${W.other?'sel':''}" onclick="W.other=true;wRender()"><div class="ic">＋</div><div class="t"><div>Other</div><div class="mut small">Type a network address, pick a serial port, or try the demo game</div></div></div>`;
+  h+=`<div class="reveal ${W.other?'open':''}"><div><div style="padding:6px 4px 0">
+   <label class="f"><span>Connection</span><select id="w_os" onchange="wOther()"><option value="tcp">Network address (ScoreBridge, serial-to-Ethernet box)</option><option value="serial">Serial port (USB-serial cable, ScoreBridge on USB)</option><option value="scorelink">Sportzcast ScoreBot (ScoreLinkII), auto-detect</option><option value="demo">Demo game (not saved)</option></select></label>
+   <div id="w_tcp" style="display:flex;gap:10px"><label class="f" style="flex:3"><span>Address</span><input id="w_host" placeholder="scorebridge.local or 192.168.1.50" value="${esc(S.values['tcp.host']||'')}"></label><label class="f" style="flex:1"><span>Port</span><input id="w_port" value="${esc(S.values['tcp.port']||10001)}"></label></div>
+   <div id="w_ser" hidden style="display:flex;gap:10px"><label class="f" style="flex:3"><span>Port</span><select id="w_sp">${S.ports.map(p=>`<option value="${esc(p.device)}">${esc(p.device)} · ${esc(p.description)}</option>`).join('')||'<option value="">no serial ports found</option>'}</select></label><label class="f" style="flex:1"><span>Baud</span><select id="w_baud"><option>115200</option><option>19200</option><option>9600</option><option>38400</option></select></label></div>
+  </div></div></div>`;
+  const chosen=W.other||(d&&d.length&&W.sel!=null);
+  h+=`<div class="wfoot"><span class="mut small">A ScoreBridge is found by its name on the network (mDNS), then by a quick scan for port 10001.</span><button class="primary" ${chosen?'':'disabled'} onclick="wUse()">${W.other?'Use this':d&&W.sel!=null&&d[W.sel]?'Use '+esc(d[W.sel].title.split(' · ')[0]):'Next'} →</button></div>`;
+  b.innerHTML=h;if(W.other)wOther();return;}
+ if(s==2){const pid=S.values['scoreboard.protocol']||'';const cur=W.brand??(brandOf(pid)||{}).name??'';W.brand=cur;if(!W.proto)W.proto=pid;
+  const br=S.scoreboards.find(x=>x.name==cur);
+  let h=`<h2>Which scoreboard is it?</h2><div class="mut">A Daktronics console names its sport by itself; other brands need it picked.</div>
+  <label class="f"><span>Brand</span><select id="w_brand" onchange="wBrand(this.value)"><option value="">Daktronics All Sport 5000 (detects the sport itself)</option>${S.scoreboards.map(x=>`<option ${x.name==cur?'selected':''}>${esc(x.name)}</option>`).join('')}</select></label>
+  <div class="reveal" id="w_rv"><div><label class="f"><span>Sport</span></label><div class="chips" id="w_chips"></div>
+   <div class="reveal" id="w_modrv"><div><label class="f"><span>Console model / layout</span><select id="w_model" onchange="W.proto=this.value"></select></label></div></div>
+   <div id="w_connw"><label class="f"><span>Wiring</span><select id="w_conn" onchange="W.conn=+this.value"></select></label></div></div></div>
+  <div id="w_dak" style="margin-top:14px"></div>
+  <div style="margin-top:18px"><h3>Live check</h3><div class="live" id="w_live"></div><div class="mut small" style="margin-top:4px">Change the clock or score on the console: this should move.</div></div>
+  <div class="wfoot"><button onclick="wGo(1)">← Back</button><button class="primary" onclick="wSaveBoard()">Next →</button></div>`;
+  b.innerHTML=h;wBrand(cur,true);wLive();return;}
+ if(s==3){const o=ST.outputs,url=`http://${o.lan_ip}:${o.http_port}/data.xml`,on=!!S.values['vmix.enabled'];
+  b.innerHTML=`<h2>Connect vMix</h2><div class="mut">In vMix: <b style="color:var(--ink)">Settings → Data Sources → Add → XML</b>, paste this address, and link the title fields to the values you want.</div>
+  <div class="copy" style="font-size:14px;padding:8px 10px;margin-top:12px"><span>${esc(url)}</span><b onclick="copyText('${esc(url)}')">Copy</b></div>
+  <div class="mut small" style="margin-top:8px" id="w_xml"></div>
+  <div class="row" style="margin-top:18px"><span><b>Also push values with SetText</b><div class="mut small">Optional: sends each value straight into one vMix title over the TCP API.</div></span><button class="sw ${on?'on':''}" id="w_stsw" onclick="this.classList.toggle('on');$('w_strv').classList.toggle('open',this.classList.contains('on'))"></button></div>
+  <div class="reveal ${on?'open':''}" id="w_strv"><div><div style="display:flex;gap:10px"><label class="f" style="flex:2"><span>vMix computer</span><input id="w_vh" value="${esc(S.values['vmix.host']||'127.0.0.1')}"></label><label class="f" style="flex:2"><span>Title input name or number</span><input id="w_vi" value="${esc(S.values['vmix.input']||'')}"></label></div></div></div>
+  <div class="wfoot"><button onclick="wGo(2)">← Back</button><button class="primary" onclick="wSaveVmix()">Next →</button></div>`;wLive();return;}
+ if(s==4){const o=ST.outputs,m=!!S.values['mqtt.enabled'],wh=!!S.values['webhook.enabled'];
+  b.innerHTML=`<h2>Network outputs</h2><div class="mut">For other apps on the network. Leave them as they are if you're not sure.</div>
+  <div class="row" style="margin-top:16px"><span><b>MQTT</b><div class="mut small">ScoreConnect-compatible: OpenStatsEngine and anything that used ScoreConnect read this.</div></span><button class="sw ${m?'on':''}" id="w_mq" onclick="this.classList.toggle('on');$('w_mqrv').classList.toggle('open',this.classList.contains('on'))"></button></div>
+  <div class="reveal ${m?'open':''}" id="w_mqrv"><div><div style="display:flex;gap:10px;align-items:flex-end"><label class="f" style="flex:1"><span>Bot number</span><input id="w_bot" value="${esc(S.values['mqtt.bot_number'])}"></label>
+   <div style="flex:3"><div class="mut small">Point the other app at</div><div class="copy"><span>${esc(o.lan_ip)}:${esc(S.values['mqtt.tcp_port'])} (WebSocket :${esc(S.values['mqtt.ws_port'])})</span><b onclick="copyText('${esc(o.lan_ip)}')">Copy</b></div></div></div></div></div>
+  <div class="row" style="margin-top:12px"><span><b>JSON / CSV</b><div class="mut small">Always on: :${o.http_port}/data.json and /data.csv</div></span><span class="pill okb">on</span></div>
+  <div class="row" style="margin-top:4px"><span><b>Webhook</b><div class="mut small">POSTs the data as JSON to a URL on every change.</div></span><button class="sw ${wh?'on':''}" id="w_wh" onclick="this.classList.toggle('on');$('w_whrv').classList.toggle('open',this.classList.contains('on'))"></button></div>
+  <div class="reveal ${wh?'open':''}" id="w_whrv"><div><label class="f"><span>URL</span><input id="w_whurl" placeholder="http://…" value="${esc(S.values['webhook.url']||'')}"></label></div></div>
+  <div class="mut small" id="w_msg" style="margin-top:10px"></div>
+  <div class="wfoot"><button onclick="wGo(3)">← Back</button><button class="primary" onclick="wSaveNet()">Next →</button></div>`;return;}
+ if(s==5){b.innerHTML=`<h2>All set</h2><div class="mut">You can change any of this later in Settings, or run the setup again from there.</div><div id="w_sum" style="margin-top:14px"></div>
+  <div class="wfoot"><button onclick="wGo(4)">← Back</button><button class="primary" onclick="finishWizard()">Go to the dashboard →</button></div>`;wLive();}
 }
+function wOther(){const v=$('w_os').value;$('w_tcp').hidden=v!='tcp';$('w_ser').hidden=v!='serial';}
+async function wUse(){let ch;
+ if(W.other){const v=$('w_os').value;
+  ch=v=='tcp'?{source:'tcp','tcp.host':$('w_host').value.trim(),'tcp.port':$('w_port').value.trim()}:v=='serial'?{source:'serial',port:$('w_sp').value,baud:$('w_baud').value}:v=='scorelink'?{source:'scorelink',port:'auto'}:{source:'demo'};
+  if(v=='tcp'&&!ch['tcp.host']){toast('Type the address');return;}}
+ else ch=W.devs[W.sel].settings;
+ const r=await postSettings(ch);if(r.ok){await getSettings();wGo(2);}}
+function wEvents(br){const ev={};br.sports.forEach(x=>(ev[x.event||'Other']=ev[x.event||'Other']||[]).push(x));return ev;}
+function wBrand(name,first){W.brand=name;const br=S.scoreboards.find(x=>x.name==name);const rv=$('w_rv');
+ if(br){if(!br.sports.some(x=>x.id==W.proto))W.proto=br.sports.find(x=>/football/i.test(x.event||''))?.id||br.sports[0].id;
+  const ev=wEvents(br),cur=(br.sports.find(x=>x.id==W.proto)||{}).event||'Other';
+  $('w_chips').innerHTML=Object.keys(ev).map((e,i)=>`<span class="chip ${e==cur?'sel':''}" data-e="${esc(e)}" style="transition-delay:${Math.min(i,12)*45}ms" onclick="wEvent(this.dataset.e)">${esc(e.replace(/([a-z])([A-Z])/g,'$1 $2'))}</span>`).join('');
+  $('w_conn').innerHTML=br.connections.map((c,i)=>`<option value="${i}">${esc(c)}</option>`).join('');
+  if(!first)W.conn=0;$('w_conn').value=String(W.conn||0);$('w_connw').hidden=br.connections.length<2;wModels(br,cur,true);}
+ else W.proto='';
+ if(first&&br){rv.style.transition='none';rv.offsetHeight;rv.classList.add('open');requestAnimationFrame(()=>rv.style.transition='');}
+ else{rv.classList.remove('open');if(br){rv.querySelectorAll('.chip').forEach(c=>c.style.opacity);requestAnimationFrame(()=>requestAnimationFrame(()=>rv.classList.add('open')));}}
+ $('w_dak').hidden=!!br;wDak();}
+function wModels(br,e,keep){const list=wEvents(br)[e]||[];const strip=d=>d.replace(new RegExp('^'+br.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s+','i'),'');
+ if(!keep||!list.some(x=>x.id==W.proto))W.proto=list[0]?list[0].id:'';
+ $('w_model').innerHTML=list.map(x=>`<option value="${esc(x.id)}" ${x.id==W.proto?'selected':''}>${esc(strip(x.description))}</option>`).join('');
+ $('w_modrv').classList.toggle('open',list.length>1);}
+function wEvent(e){const br=S.scoreboards.find(x=>x.name==W.brand);document.querySelectorAll('#w_chips .chip').forEach(c=>c.classList.toggle('sel',c.dataset.e==e));wModels(br,e,false);}
+function wDak(){const el=$('w_dak');if(!el||el.hidden||!ST)return;
+ el.innerHTML=ST.cl_table&&ST.cl_table.length?`<span class="ok">✓</span> Sport detected: <b>${esc(ST.data.sport||ST.sport)}</b>`:
+  `<span class="mut">Waiting for the console to say which sport it is. If it never does (RTD port), pick it:</span> <select id="w_sport" style="width:auto;margin-left:6px">${(S.choices.sport||[]).map(x=>`<option ${x==S.values.sport?'selected':''}>${esc(x)}</option>`).join('')}</select>`;}
+async function wSaveBoard(){const ch={'scoreboard.protocol':W.proto||''};if(W.proto)ch['scoreboard.connection']=W.conn||0;
+ const sp=$('w_sport');if(!W.proto&&sp)ch.sport=sp.value;
+ const r=await postSettings(ch);if(r.ok){await getSettings();wGo(3);}}
+async function wSaveVmix(){const on=$('w_stsw').classList.contains('on');const ch={'vmix.enabled':on};if(on){ch['vmix.host']=$('w_vh').value.trim();ch['vmix.input']=$('w_vi').value.trim();}
+ const r=await postSettings(ch);if(r.ok){await getSettings();wGo(4);}}
+async function wSaveNet(){const m=$('w_mq').classList.contains('on'),wh=$('w_wh').classList.contains('on');
+ const ch={'mqtt.enabled':m,'webhook.enabled':wh};if(m)ch['mqtt.bot_number']=$('w_bot').value.trim();if(wh)ch['webhook.url']=$('w_whurl').value.trim();
+ if(wh&&!ch['webhook.url']){toast('Type the webhook URL, or turn it off');return;}
+ const r=await postSettings(ch);if(r.ok){await getSettings();W.restart=r.restart_needed.length>0;wGo(5);}}
+function wLive(){if($('wiz').hidden||!ST)return;const d=ST.data,s=ST;
+ const l=$('w_live');if(l)l.innerHTML=`<span>${esc(abbr(d,'home'))} ${esc(d.home_score??0)}</span><span>${esc(d.clock||'--:--')} · ${esc(d.period_ordinal||'')}</span><span>${esc(abbr(d,'guest'))} ${esc(d.guest_score??0)}</span><span class="small ${s.packet_age!=null&&s.packet_age<10?'ok':'mut'}" style="font-family:system-ui">${s.packet_age==null?'no data yet':s.packet_age<10?'● live':'last data '+Math.round(s.packet_age)+' s ago'}</span>`;
+ const x=$('w_xml');if(x){const a=s.outputs.xml.age;x.innerHTML=a!=null&&a<30?'<span class="ok">✓ vMix (or something) is reading it</span>':'Waiting for vMix to read it…';}
+ if(W.step==2)wDak();
+ const sm=$('w_sum');if(sm){const o=s.outputs,live=s.packet_age!=null&&s.packet_age<10;
+  const it=[[live,'Scoreboard data',inputTitle(s)],[o.xml.age!=null,'vMix reading data.xml',o.xml.age!=null?ageTxt(o.xml.age):'not yet: add the Data Source in vMix'],
+   [!o.vmix.enabled||o.vmix.state.startsWith('connected'),'vMix SetText push',o.vmix.enabled?o.vmix.state:'off'],
+   [true,'MQTT',o.mqtt.enabled?o.mqtt.clients+' client(s)':o.mqtt.configured?'starts after a restart of ScoreReader':'off'],
+   [!o.webhook.enabled||o.webhook.state.startsWith('ok'),'Webhook',o.webhook.enabled?o.webhook.state:'off']];
+  sm.innerHTML=it.map(([ok,t,d])=>`<div class="row"><span>${ok?'<span class="ok">✓</span>':'<span style="color:var(--warn)">!</span>'} &nbsp;${esc(t)}</span><span class="mut small">${esc(d)}</span></div>`).join('');}}
+
+/* ---------- poll ---------- */
+let firstTick=true;
+async function tick(){
+ try{const s=await (await fetch('/api/state')).json();ST=s;
+  $('hstat').textContent=`${s.bytes_in.toLocaleString()} bytes · ${s.packets.toLocaleString()} packets · ${s.bad_packets} bad`;
+  const dm=$('demo');dm.hidden=s.source_saved;if(!s.source_saved)$('demotxt').textContent=s.source=='demo'?'DEMO MODE: simulated game, not the scoreboard':'REPLAY: playing back '+(s.replay_file||'a capture')+', not live data';
+  renderHome(s);if(TAB=='diag')renderDiag(s);wLive();
+  if(firstTick){firstTick=false;if(!s.setup_done)openWizard(1);}
+ }catch(e){$('overall').textContent='dashboard lost connection';$('overall').className='pill badb';}
+}
+foldNet(lsGet('sr_net')=='1');
+const t0=lsGet('sr_tab');if(t0&&t0!='settings')showTab(t0);
+$('flt').oninput=()=>ST&&renderDiag(ST);
 setInterval(tick,250);tick();
 </script></body></html>"""
 
@@ -1691,6 +2147,7 @@ class App:
             self.mqtt = SportzcastMqttOutput(cfg, log=log)
         self.reader = self._new_reader()
         self.vmix = VmixPusher(cfg, threading.Event()) if cfg["vmix"].get("enabled") else None
+        self.webhook = self._new_webhook()
         self.data: dict = {}
         self.data_lock = threading.Lock()
 
@@ -1819,6 +2276,20 @@ class App:
         else:
             STATUS.vmix_state = "disabled"
 
+    def _new_webhook(self):
+        if get_path(self.cfg, "webhook.enabled") and get_path(self.cfg, "webhook.url"):
+            return WebhookPusher(self.cfg, threading.Event())
+        STATUS.webhook_state = "disabled" if not get_path(self.cfg, "webhook.enabled") else "no URL set"
+        return None
+
+    def restart_webhook(self):
+        if self.webhook:
+            self.webhook.stop.set()
+        self.webhook = self._new_webhook()
+        if self.webhook and self.running:
+            self.webhook.start()
+            self.gen += 1  # send the current data straight away
+
     # ---- settings
     def live_source(self) -> str:
         """The source to go back to after demo/replay: the saved one, or the ScoreBot."""
@@ -1907,6 +2378,8 @@ class App:
                 self.restart_reader()
             if "vmix" in kinds:
                 self.restart_vmix()
+            if "webhook" in kinds:
+                self.restart_webhook()
             self.gen += 1
         return {"ok": True, "changed": sorted(changed),
                 "restart_needed": sorted(p for p in changed if SETTINGS[p][3] == "restart")}
@@ -1993,6 +2466,9 @@ class App:
                     vm.submit(d)
                 if self.mqtt:
                     self.mqtt.update(d, contract=self.mqtt_contract(d))
+                wh = self.webhook
+                if wh:
+                    wh.submit(flatten(self.public(d)))
                 tf = self.cfg.get("text_files", {})
                 if tf.get("enabled"):
                     try:
@@ -2011,6 +2487,37 @@ class App:
         self.reader.stop.set()
         if self.vmix:
             self.vmix.stop.set()
+        if self.webhook:
+            self.webhook.stop.set()
+
+    def outputs_json(self) -> dict:
+        """What the Home page shows about each output: on/off, state, and who read it lately."""
+        now = time.time()
+        with STATUS.lock:
+            reads = dict(STATUS.reads)
+
+        def read(path):
+            t, who = reads.get(path, (0, ""))
+            return {"age": round(now - t, 1) if t else None, "by": who}
+
+        m = self.cfg.get("mqtt", {}) or {}
+        out = self.mqtt.out if self.mqtt else None
+        return {
+            "lan_ip": lan_ip(),
+            "http_port": int(self.cfg["http_port"]),
+            "xml": read("/data.xml"), "json": read("/data.json"), "json_obj": read("/data.obj.json"),
+            "csv": read("/data.csv"),
+            "vmix": {"enabled": bool(self.cfg["vmix"].get("enabled")), "state": STATUS.vmix_state,
+                     "host": self.cfg["vmix"].get("host"), "input": self.cfg["vmix"].get("input")},
+            "mqtt": {"enabled": self.mqtt is not None, "state": out.status if out else "disabled",
+                     "clients": getattr(out, "client_count", 0) if out else 0, "mode": m.get("mode"),
+                     "bot": m.get("bot_number"), "tcp_port": m.get("tcp_port"), "ws_port": m.get("ws_port"),
+                     "broker_host": m.get("broker_host"), "broker_port": m.get("broker_port"),
+                     "configured": bool(m.get("enabled"))},
+            "webhook": {"enabled": self.webhook is not None, "state": STATUS.webhook_state,
+                        "url": get_path(self.cfg, "webhook.url", "")},
+            "text_files": bool(get_path(self.cfg, "text_files.enabled")),
+        }
 
     def state_json(self) -> dict:
         with self.swap_lock:
@@ -2052,6 +2559,12 @@ class App:
             "contract": self._contract_rows(),
             "cl_table": cl.address_table(),
             "cl_bad": cl.bad,
+            "outputs": self.outputs_json(),
+            "setup_done": bool(self.cfg.get("setup_done")),
+            "tcp": {"host": get_path(self.cfg, "tcp.host", ""), "port": get_path(self.cfg, "tcp.port", 0)},
+            "port": self.cfg.get("port"),
+            "record_raw": bool(self.cfg.get("record_raw")),
+            "version": __version__,
         }
 
     def _contract_rows(self) -> list:
@@ -2081,7 +2594,9 @@ class App:
             def do_GET(self):
                 u = urllib.parse.urlparse(self.path)
                 d = app.public(app.current())  # only the fields used in the sport (unless output_all_fields)
-                flat = {k: (("1" if v else "0") if isinstance(v, bool) else v) for k, v in d.items()}
+                flat = flatten(d)
+                if u.path in ("/data.json", "/data.obj.json", "/data.xml", "/data.csv"):
+                    STATUS.note_read(u.path, self.client_address[0])
                 if u.path in ("/", "/index.html"):
                     return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
                 if u.path == "/data.json":
@@ -2110,6 +2625,16 @@ class App:
                     return self._send(200, json.dumps(app.state_json()), "application/json")
                 if u.path == "/api/settings":
                     return self._send(200, json.dumps(app.settings_json(), ensure_ascii=False), "application/json")
+                if u.path == "/api/discover":
+                    import discovery
+
+                    scan = (urllib.parse.parse_qs(u.query).get("scan") or ["1"])[0] != "0"
+                    try:
+                        found = discovery.discover(scan=scan)
+                    except Exception as e:  # never break the wizard: it still offers "Other"
+                        log(f"Device search failed: {e}")
+                        found = []
+                    return self._send(200, json.dumps({"devices": found}, ensure_ascii=False), "application/json")
                 return self._send(404, "not found", "text/plain")
 
             def do_POST(self):
@@ -2171,6 +2696,8 @@ class App:
             self.vmix.start()
         if self.mqtt:
             self.mqtt.start()
+        if self.webhook:
+            self.webhook.start()
         threading.Thread(target=self.update_loop, daemon=True).start()
         port = int(self.cfg["http_port"])
         srv = ThreadingHTTPServer(("0.0.0.0", port), self.make_handler())

@@ -29,30 +29,40 @@ Scoreboard console ──▶ ScoreBot (USB) ──▶ ScoreReader ──▶ vMix
 
 **2. Close ScoreConnect III.** It holds the ScoreBot's port. On Windows, run `windows\Stop ScoreConnect service (run as admin).bat` as administrator, or set the **ScoreConnectIII** service to *Disabled*.
 
-**3. Plug in the ScoreBot, turn on the console, and start ScoreReader.** Open **http://localhost:8765/** to see the dashboard.
+**3. Plug in the ScoreBot or ScoreBridge, turn on the console, and start ScoreReader.** Open **http://localhost:8765/** (from another computer: `http://<this-computer>:8765/`).
 
-**4. Pick your scoreboard.** Click **Settings → Scoreboard**. For a Daktronics All Sport 5000, leave it on **Daktronics All Sport 5000 (built-in, automatic)**; it detects football or soccer by itself. For any other board, choose the brand and sport. Enter your team names under **Settings → Teams**.
+**4. Follow the setup.** The first time, ScoreReader walks you through five steps:
+1. **Connect:** it searches the network and USB and lists what it finds (a ScoreBridge, a ScoreBot, other USB-serial cables). Pick one, or choose **Other** to type an address or try the demo game.
+2. **Scoreboard:** leave it on **Daktronics All Sport 5000**, which detects the sport by itself, or pick the brand, then the sport (and the console model if the brand has several).
+3. **vMix:** copy the Data Source address; SetText push is optional.
+4. **Network outputs:** MQTT (for OSE), JSON/CSV and the webhook.
+5. **Done.** You can run it again any time from **Settings → Run setup again**.
+
+Enter your team names on the **Teams** tab.
 
 > **Tip:** the console only sends a value when it changes, so bump each score and the period once before the game.
 
-No scoreboard handy? Choose **Settings → Source → Demo** (or run with `--demo`) for a pretend football game, which is handy for building graphics. Demo mode is never saved, so ScoreReader always starts with live data.
+No scoreboard handy? Choose **Other → Demo game** in the setup, or **Diagnostics → Demo game** (or run with `--demo`) for a pretend football game, which is handy for building graphics. Demo mode is never saved, so ScoreReader always starts with live data.
 
 ## Connect your graphics
 
-**vMix:** in vMix, go to *Settings → Data Sources → Add → JSON*, enter `http://localhost:8765/data.json` and set the shortest refresh time. For an even faster clock, turn on **Settings → vMix → Push values to vMix**.
+The **Home** tab shows every address with a **Copy** button, and a green dot once something reads it.
 
-**OSE and other ScoreConnect clients:** point them at this computer's address, port **1883** (or `ws://<this-computer>:8083/mqtt`), and set **Settings → MQTT → Bot number** to the bot number they expect. They receive the same data as from ScoreConnect.
+**vMix:** in vMix, go to *Settings → Data Sources → Add → XML*, paste the address from **Home → vMix** (`http://<this-computer>:8765/data.xml`) and set the shortest refresh time. For an even faster clock, turn on **SetText push**.
 
-Field names such as `clock`, `home_score`, `period` and `down_distance` are listed on the dashboard and in the [reference](docs/REFERENCE.md#data-fields).
+**OSE and other ScoreConnect clients (MQTT):** open **Home → Network outputs**. Point them at the address shown there (port **1883**, or `ws://<this-computer>:8083/mqtt`), and set the bot number in **Settings → Network outputs → MQTT** to the one they expect. They receive the same data as from ScoreConnect.
+
+Field names such as `clock`, `home_score`, `period` and `down_distance` are listed on the **Diagnostics** tab and in the [reference](docs/REFERENCE.md#data-fields).
 
 ## If something's wrong
 
 | Problem | Try this |
 |---|---|
 | "Access is denied" or "port busy" | ScoreConnect or its service is still running. Stop it (step 2). |
-| Connected, but nothing changes | Is the console on? Bump a score. Then click **Re-init bot** in the dashboard. |
+| Connected, but nothing changes | Is the console on? Bump a score. Then click **Diagnostics → Re-init bot**. |
 | Linux: "Permission denied" | Run `./linux/install.sh`, then unplug and replug the ScoreBot. |
 | A value is wrong or missing | See [fixing a value that reads wrong](docs/REFERENCE.md#fixing-a-value-that-reads-wrong-custom_fields). |
+| The setup doesn't find the ScoreBridge | Some networks block the name search (mDNS). Choose **Other → Network address** and type the bridge's IP (shown on its own page), port 10001. |
 | Still stuck | Send the newest `logs/raw_*.bin` file with a description of the problem. |
 
 The non-Daktronics brands haven't been tested on a real board yet. If yours reads wrong, the `logs/raw_*.bin` capture is what we need to fix it.
