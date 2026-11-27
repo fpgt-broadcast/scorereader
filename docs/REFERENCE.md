@@ -108,6 +108,10 @@ The dashboard (`http://<this-computer>:8765/`) has four tabs:
 
 A ScoreBridge found by mDNS is saved by its `.local` name; one found by the scan is saved by IP, so give it a fixed IP on its settings page.
 
+**ScoreBridge network (DHCP or static IP).** Needs ScoreBridge firmware 1.1 or newer. With the source set to a ScoreBridge on USB (Serial) or on the network (TCP), Settings › Scoreboard input shows a **ScoreBridge network** card: what address it has now, DHCP or Static IP, and **Send to ScoreBridge**. The box restarts (about 5 s). Over the network, ScoreReader then reads it at its new address (the static IP, or `name.local` for DHCP). In first-run setup, picking a ScoreBridge on USB offers **Put it on the network**: the address is sent over USB, ScoreReader waits for the box to answer on the network and switches to it.
+
+API: `GET /api/bridge/network[?via=usb&port=COM7 | ?via=net&host=…]`, `POST /api/bridge/network` `{"dhcp": false, "ip": "192.168.1.50", "mask": "255.255.255.0", "gateway": "192.168.1.1", "dns": "", "hostname": "scorebridge"}` (plus optional `via`/`port`/`host`; default = the current source), `POST /api/bridge/wait` `{"address": "…"}`. On the box: `GET/POST /api/network` (form fields `host ip mask gw dns`, blank ip = DHCP); on USB one line `@SB GET` or `@SB NET host=… ip=… mask=… gw=… dns=…`, answered with JSON between `\r\n@SB>` and `<@SB\r\n`. A settings password on the box blocks changes over the network (change them on its own page).
+
 ## Scoreboard brands
 
 ScoreReader can decode about 300 brand/sport layouts, which covers everything ScoreConnect III supports. Pick one in **Settings → Scoreboard**: the brand, then the sport or console layout, then the wiring if the brand has more than one. You can also start with `--scoreboard ID`; `--list-scoreboards` prints every ID.

@@ -12,6 +12,7 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 |---|---|
 | `scorereader.py` | Everything except MQTT: config, serial/HID (`MCP2221`, `WinHID`), PIC commands, sources (`Reader`: scorelink, serial, tcp, demo, replay), decoders (`DaktronicsRTD`, `DaktronicsCurrentLoop`, `SportMap`), outputs (`VmixPusher`, text files), HTTP server and dashboard (`App`, `DASHBOARD_HTML`), CLI |
 | `discovery.py` | First-run device search (`/api/discover`): ScoreBridge by mDNS `_scorebridge._tcp`, `scorebridge.local`, then a /24 scan of port 10001 confirmed by `/api/status`; USB ports classified (ScoreBot MCP2221, CH340 = ScoreBridge USB). Dependency-free. |
+| `bridgecfg.py` | ScoreBridge network settings (DHCP / static): `clean_network` checks, `http_get/set` (`/api/network`, firmware 1.1+), USB `@SB GET|NET` lines with `ReplySplitter` taking the framed reply out of the console stream. `App.bridge_network` picks USB or network from the source; over USB with the serial source on that port it goes through `Reader.bridge_request` (port already open). Dashboard: Settings › Scoreboard input card, and the wizard's "Put it on the network" for a ScoreBridge on USB. |
 | `sportzcast_mqtt.py` | `build_payloads()` (Sportzcast JSON plus 150-char sbdata, football and soccer), `MiniBroker` (dependency-free MQTT 3.1/3.1.1/5 broker with WebSocket support), `MqttPublisherClient`, `SportzcastMqttOutput` glue |
 | `scoreboards/` | Multi-vendor decoders: `base.py` (Protocol/Decoder framework), `common.py` (digit/BCD/checksum helpers), `pic55aa.py` (PIC decode-mode framing), one module per brand, `contracts.py` (contract → output fields, Sportzcast JSON, sbdata, clock-status emulation), `hardware.py` (bot set-up per wiring option), `catalog.json` (brands, sports, wiring from ScoreConnect's config DB). Per-brand wire docs in `docs/vendors/`. |
 | `linux/`, `mac/` | `install.sh` (packages, udev rule, hid_mcp2221 blacklist, optional systemd service), launchers |
@@ -47,7 +48,7 @@ ScoreReader replaces Sportzcast **ScoreConnect III** for a high-school broadcast
 ## Commands
 ```bash
 python -m pytest -q                       # run before every commit
-python -m pyflakes scorereader.py sportzcast_mqtt.py discovery.py scoreboards
+python -m pyflakes scorereader.py sportzcast_mqtt.py discovery.py bridgecfg.py scoreboards
 python scorereader.py --demo              # dashboard on :8765, MQTT on :1883/:8083
 python scorereader.py --replay logs/raw_X.bin --no-mqtt
 python scorereader.py --list-scoreboards  # every brand/sport id

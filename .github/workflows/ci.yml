@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      - run: python -m pyflakes scorereader.py sportzcast_mqtt.py discovery.py menubar.py scoreboards
+      - run: python -m pyflakes scorereader.py sportzcast_mqtt.py discovery.py bridgecfg.py menubar.py scoreboards
       - run: python -m pytest -q
 
   build:
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           SEP=":"; [ "$RUNNER_OS" = "Windows" ] && SEP=";"
-          COMMON=(--noconfirm --name ScoreReader --hidden-import sportzcast_mqtt --hidden-import discovery --collect-submodules scoreboards
+          COMMON=(--noconfirm --name ScoreReader --hidden-import sportzcast_mqtt --hidden-import discovery --hidden-import bridgecfg --collect-submodules scoreboards
                   --add-data "daktronics_fields.json${SEP}." --add-data "scoreboards/catalog.json${SEP}scoreboards"
                   --add-data "assets${SEP}assets")
           if [ "$RUNNER_OS" = "macOS" ]; then

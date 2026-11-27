@@ -1212,6 +1212,35 @@ class Reader(threading.Thread):
         self.reinit_request = threading.Event()
         self.raw_sink: queue.Queue | None = None  # for --sniff
         self.raw_hook = None  # e.g. MQTT bot/N/raw
+        self.usb_req = None  # a ScoreBridge USB command waiting for the serial loop (bridge_request)
+        self.serial_port = None  # the port run_serial has open
+
+    def bridge_request(self, line: bytes, timeout: float = 4.0) -> dict:
+        """Send a ScoreBridge command over the USB port this reader already has open (see bridgecfg)."""
+        import bridgecfg
+
+        req = {"line": line, "timeout": timeout, "done": threading.Event(), "reply": None, "error": None}
+        self.usb_req = req
+        if not req["done"].wait(timeout + 3):
+            self.usb_req = None
+            raise bridgecfg.BridgeError("the USB port isn't being read right now")
+        if req["error"]:
+            raise bridgecfg.BridgeError(req["error"])
+        return req["reply"]
+
+    def _serve_usb_req(self, ser):
+        import bridgecfg
+
+        req, self.usb_req = self.usb_req, None
+
+        def console(d):
+            self._record(d)
+            self._feed(d)
+        try:
+            req["reply"] = bridgecfg.exchange(ser.write, ser.read, req["line"], req["timeout"], on_data=console)
+        except Exception as e:
+            req["error"] = str(e)
+        req["done"].set()
 
     def _feed(self, data: bytes):
         if self.raw_hook is not None:
@@ -1313,7 +1342,10 @@ class Reader(threading.Thread):
                 session(configure)
                 log(f"ScoreLinkII in DATA mode, reading at {baud} baud")
             STATUS.set_source("connected", f"{port} @ {baud}")
+            self.serial_port = port
             while not self.stop.is_set():
+                if self.usb_req is not None and not scorelink:
+                    self._serve_usb_req(ser)
                 if self.reinit_request.is_set():
                     self.reinit_request.clear()
                     if scorelink and mcp is not None:
@@ -1323,6 +1355,7 @@ class Reader(threading.Thread):
                     self._record(data)
                     self._feed(data)
         finally:
+            self.serial_port = None
             ser.close()
             if mcp:
                 mcp.close()
@@ -1678,6 +1711,14 @@ label.set{display:grid;grid-template-columns:1fr minmax(180px,300px);gap:12px;al
 label.set>input[type=checkbox]{justify-self:end}
 .setbar{position:sticky;bottom:0;background:var(--bg);padding:14px 0;display:flex;gap:10px;align-items:center;margin-top:8px}
 #setmsg{flex:1;font-size:13px}
+/* ScoreBridge network (DHCP / static) */
+.seg{display:inline-flex;background:#0f1319;border:1px solid #333d4b;border-radius:9px;padding:3px;margin-top:10px}
+.seg button{background:none;border:0;padding:6px 16px;border-radius:7px;color:var(--mut)}.seg button.on{background:var(--acc);color:#fff;font-weight:600}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}@media(max-width:600px){.grid2{grid-template-columns:1fr}}
+.badge{font-size:12px;padding:3px 9px;border-radius:99px;background:rgba(91,141,239,.18);color:var(--acc);white-space:nowrap}
+.bnhead{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.choice{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 4px;border-top:1px solid var(--line);cursor:pointer}
+.choice.sel b{color:var(--acc)}
 /* reveal animation (brand -> sport -> wiring) */
 .reveal{display:grid;grid-template-rows:0fr;opacity:0;transform:translateY(-6px);transition:grid-template-rows .4s ease,opacity .3s ease .08s,transform .3s ease .08s}
 .reveal>div{overflow:hidden}.reveal.open{grid-template-rows:1fr;opacity:1;transform:none}
@@ -1988,13 +2029,42 @@ function renderSettings(){
    list.forEach(sp=>{if(sp.path=='scoreboard.protocol'){h+=sbPicker();return;}if(sp.path=='scoreboard.connection')return;h+=setRow(sp);});
    if(g=='Files')h+=`<p class="mut small" style="margin:4px 0">Text files go to ${esc(S.text_folder)}</p>`;
    h+='</fieldset>';
+   if(g=='Data source')h+='<fieldset id="bnet" hidden><legend>ScoreBridge network</legend><div id="bnetbody"></div></fieldset>';
    if(g=='MQTT'){const oa=S.spec.find(x=>x.path=='output_all_fields');
     h+=`<fieldset><legend>JSON / CSV</legend><div class="mut small">Always on.</div><div class="copy" style="max-width:520px"><span>${esc(base)}/data.json</span><b onclick="copyText('${esc(base)}/data.json')">Copy</b></div><div class="copy" style="max-width:520px"><span>${esc(base)}/data.csv</span><b onclick="copyText('${esc(base)}/data.csv')">Copy</b></div>${oa?setRow(oa):''}</fieldset>`;}
   }
   h+='</div>';}
  $('setform').innerHTML=h;$('cfgpath').textContent=S.config_path;$('setmsg').textContent='';$('setmsg').className='mut';
  $('portlist').innerHTML='<option value="auto">auto-detect</option>'+S.ports.map(p=>`<option value="${esc(p.device)}">${esc(p.description)}${p.scorelink?' (ScoreBot)':''}</option>`).join('');
- const src=$(sid('source'));if(src)src.onchange=showFor;const mm=$(sid('mqtt.mode'));if(mm)mm.onchange=showFor;sbBrand(true);}
+ const src=$(sid('source'));if(src)src.onchange=showFor;const mm=$(sid('mqtt.mode'));if(mm)mm.onchange=showFor;sbBrand(true);bnetLoad();}
+/* ---------- ScoreBridge network settings (Settings card + wizard) ---------- */
+let BN={via:'',target:'',net:null,dhcp:true};
+function bnetFields(id,net,dhcp){net=net||{};
+ return `<div class="seg" id="${id}_seg"><button type="button" class="${dhcp?'on':''}" onclick="bnetMode('${id}',true)">DHCP (automatic)</button><button type="button" class="${dhcp?'':'on'}" onclick="bnetMode('${id}',false)">Static IP</button></div>
+ <div class="reveal ${dhcp?'':'open'}" id="${id}_st"><div><div class="grid2">
+ <label class="f"><span>IP address</span><input id="${id}_ip" placeholder="192.168.1.50" value="${esc(net.ip||net.current_ip||'')}"></label>
+ <label class="f"><span>Subnet mask</span><input id="${id}_mask" placeholder="255.255.255.0" value="${esc(net.mask||'255.255.255.0')}"></label>
+ <label class="f"><span>Gateway (optional)</span><input id="${id}_gw" placeholder="192.168.1.1" value="${esc(net.gateway||'')}"></label>
+ <label class="f"><span>DNS (optional)</span><input id="${id}_dns" value="${esc(net.dns||'')}"></label></div></div></div>
+ <div class="mut small" id="${id}_dh" ${dhcp?'':'hidden'} style="margin-top:8px">The router gives it an address. ScoreReader finds it by name (${esc((net.hostname||'scorebridge')+'.local')}). Pick Static if the network has no DHCP, or so vMix always finds the same IP.</div>`;}
+function bnetMode(id,dhcp){const sg=$(id+'_seg');sg.children[0].classList.toggle('on',dhcp);sg.children[1].classList.toggle('on',!dhcp);$(id+'_st').classList.toggle('open',!dhcp);$(id+'_dh').hidden=!dhcp;}
+function bnetValues(id,hostname){const dhcp=$(id+'_seg').children[0].classList.contains('on');
+ return dhcp?{dhcp:true,hostname}:{dhcp:false,hostname,ip:$(id+'_ip').value.trim(),mask:$(id+'_mask').value.trim(),gateway:$(id+'_gw').value.trim(),dns:$(id+'_dns').value.trim()};}
+function bnetNow(n){return n.current_ip?`Now on the network as <b style="color:var(--ink)">${esc(n.current_ip)}</b> (${n.dhcp?'DHCP':'static'})`:(n.link?'Ethernet plugged in, no address yet':'Ethernet not plugged in');}
+async function bnetLoad(){const f=$('bnet');if(!f)return;const src=S.values.source;
+ if(src!='serial'&&src!='tcp'){f.hidden=true;return;}
+ f.hidden=false;$('bnetbody').innerHTML='<div class="mut" style="padding:8px 0"><span class="spin"></span> Asking the ScoreBridge…</div>';
+ let r;try{r=await (await fetch('/api/bridge/network')).json();}catch(e){r={ok:false,error:String(e)};}
+ if(!r.ok){$('bnetbody').innerHTML=`<div class="mut small" style="padding:6px 0">No ScoreBridge settings here: ${esc(r.error)}. <a href="#" onclick="bnetLoad();return false">Try again</a></div>`;return;}
+ BN={via:r.via,target:r.target,net:r.network};const n=r.network;
+ $('bnetbody').innerHTML=`<div class="bnhead"><div class="mut small">${bnetNow(n)} · Ethernet ${n.link?'linked':'unplugged'} · name ${esc(n.hostname)}</div><span class="badge">${r.via=='usb'?'talking over USB · ':'over the network · '}${esc(r.target)}</span></div>
+ ${bnetFields('bn',n,n.dhcp)}
+ <div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap"><button type="button" class="primary" onclick="bnetSave()">Send to ScoreBridge</button><button type="button" onclick="bnetLoad()">Read again</button><span class="mut small" id="bnmsg">${r.via=='usb'?'It restarts its network (about 5 s). Data on USB keeps flowing after that.':'It restarts (about 5 s) and ScoreReader follows it to the new address.'}</span></div>`;}
+async function bnetSave(){const v=bnetValues('bn',BN.net.hostname);$('bnmsg').innerHTML='<span class="spin"></span> Sending…';
+ const r=await (await fetch('/api/bridge/network',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(v)})).json();
+ if(!r.ok){$('bnmsg').className='bad small';$('bnmsg').textContent=r.error;return;}
+ $('bnmsg').className='ok small';$('bnmsg').textContent=!r.restarting?'Nothing changed.':r.followed?'Saved. It\'s restarting; ScoreReader now reads it at '+r.followed+'.':'Saved. It\'s restarting; on the network it will be at '+r.address+'.';
+ if(r.followed){await getSettings();}setTimeout(bnetLoad,r.restarting?7000:0);}
 const MQSHOW={'mqtt.tcp_port':'broker','mqtt.ws_port':'broker','mqtt.broker_host':'client','mqtt.broker_port':'client'};
 function showFor(){const src=($(sid('source'))||{}).value,bp=$('sb_brand'),mm=($(sid('mqtt.mode'))||{}).value;
  document.querySelectorAll('label.set[data-path]').forEach(l=>{const p=l.dataset.path,w=SHOW[p];l.hidden=(!!w&&!w.includes(src))||(p=='sport'&&bp&&bp.value!='')||(MQSHOW[p]&&MQSHOW[p]!=mm);});}
@@ -2022,14 +2092,16 @@ function wRender(){wSteps();const b=$('wbody');const s=W.step;
  if(s==1){const d=W.devs;
   let h=`<h2>Where does the scoreboard data come from?</h2><div class="mut">`+(d==null?'<span class="spin"></span> Looking on the network and USB…':`${d.length?'<span class="ok">'+d.length+' found</span>':'Nothing found'} &nbsp;<button class="sm" onclick="wSearch()">Search again</button>`)+'</div>';
   (d||[]).forEach((x,i)=>{h+=`<div class="dev ${W.sel===i&&!W.other?'sel':''}" onclick="W.sel=${i};W.other=false;wRender()"><div class="ic">${ICON[x.kind]||'⌁'}</div><div class="t"><div>${esc(x.title)}</div><div class="mut small">${esc(x.detail)}${x.receiving?'':''}</div></div>${i==0&&x.kind=='scorebridge'&&x.receiving?'<span class="pill okb">Recommended</span>':''}</div>`;});
+  const su=d&&W.sel!=null&&!W.other&&d[W.sel]&&d[W.sel].kind=='scorebridge_usb'?d[W.sel]:null;
+  h+=`<div class="reveal ${su?'open':''}"><div><div style="padding:4px 6px 8px">${su?wUsbNet(su):''}</div></div></div>`;
   h+=`<div class="dev ${W.other?'sel':''}" onclick="W.other=true;wRender()"><div class="ic">＋</div><div class="t"><div>Other</div><div class="mut small">Type a network address, pick a serial port, or try the demo game</div></div></div>`;
   h+=`<div class="reveal ${W.other?'open':''}"><div><div style="padding:6px 4px 0">
    <label class="f"><span>Connection</span><select id="w_os" onchange="wOther()"><option value="tcp">Network address (ScoreBridge, serial-to-Ethernet box)</option><option value="serial">Serial port (USB-serial cable, ScoreBridge on USB)</option><option value="scorelink">Sportzcast ScoreBot (ScoreLinkII), auto-detect</option><option value="demo">Demo game (not saved)</option></select></label>
    <div id="w_tcp" style="display:flex;gap:10px"><label class="f" style="flex:3"><span>Address</span><input id="w_host" placeholder="scorebridge.local or 192.168.1.50" value="${esc(S.values['tcp.host']||'')}"></label><label class="f" style="flex:1"><span>Port</span><input id="w_port" value="${esc(S.values['tcp.port']||10001)}"></label></div>
    <div id="w_ser" hidden style="display:flex;gap:10px"><label class="f" style="flex:3"><span>Port</span><select id="w_sp">${S.ports.map(p=>`<option value="${esc(p.device)}">${esc(p.device)} · ${esc(p.description)}</option>`).join('')||'<option value="">no serial ports found</option>'}</select></label><label class="f" style="flex:1"><span>Baud</span><select id="w_baud"><option>115200</option><option>19200</option><option>9600</option><option>38400</option></select></label></div>
   </div></div></div>`;
-  const chosen=W.other||(d&&d.length&&W.sel!=null);
-  h+=`<div class="wfoot"><span class="mut small">A ScoreBridge is found by its name on the network (mDNS), then by a quick scan for port 10001.</span><button class="primary" ${chosen?'':'disabled'} onclick="wUse()">${W.other?'Use this':d&&W.sel!=null&&d[W.sel]?'Use '+esc(d[W.sel].title.split(' · ')[0]):'Next'} →</button></div>`;
+  const chosen=W.other||(d&&d.length&&W.sel!=null);const tonet=su&&W.usbnet=='net';
+  h+=`<div class="wfoot"><span class="mut small">A ScoreBridge is found by its name on the network (mDNS), then by a quick scan for port 10001.</span>${tonet?`<button class="primary" id="w_unbtn" ${W.un&&W.un.ok?'':'disabled'} onclick="wUsbNetSave()">Save to ScoreBridge and continue →</button>`:`<button class="primary" ${chosen?'':'disabled'} onclick="wUse()">${W.other?'Use this':d&&W.sel!=null&&d[W.sel]?'Use '+esc(d[W.sel].title.split(' · ')[0]):'Next'} →</button>`}</div>`;
   b.innerHTML=h;if(W.other)wOther();return;}
  if(s==2){const pid=S.values['scoreboard.protocol']||'';const cur=W.brand??(brandOf(pid)||{}).name??'';W.brand=cur;if(!W.proto)W.proto=pid;
   const br=S.scoreboards.find(x=>x.name==cur);
@@ -2062,6 +2134,29 @@ function wRender(){wSteps();const b=$('wbody');const s=W.step;
  if(s==5){b.innerHTML=`<h2>All set</h2><div class="mut">You can change any of this later in Settings, or run the setup again from there.</div><div id="w_sum" style="margin-top:14px"></div>
   <div class="wfoot"><button onclick="wGo(4)">← Back</button><button class="primary" onclick="finishWizard()">Go to the dashboard →</button></div>`;wLive();}
 }
+/* wizard: a ScoreBridge found on USB can be put on the network right away */
+function wUsbNet(dev){const port=dev.settings.port;
+ if(W.unport!=port){W.unport=port;W.usbnet='usb';W.un=null;}
+ let h=`<div class="mut small" style="margin:2px 0 4px">If it's also plugged into Ethernet, ScoreReader can read it over the network instead.</div>
+ <div class="choice ${W.usbnet=='usb'?'sel':''}" onclick="W.usbnet='usb';wRender()"><span><b>Keep using USB</b><br><span class="mut small">Simplest. The cable has to reach this computer.</span></span><span class="pill ${W.usbnet=='usb'?'okb':''}">${W.usbnet=='usb'?'selected':'pick'}</span></div>
+ <div class="choice ${W.usbnet=='net'?'sel':''}" onclick="wUsbNetPick()"><span><b>Put it on the network</b><br><span class="mut small">Set its address now; then ScoreReader reads it over Ethernet and you can unplug USB.</span></span><span class="pill ${W.usbnet=='net'?'okb':''}">${W.usbnet=='net'?'selected':'pick'}</span></div>`;
+ if(W.usbnet=='net'){const u=W.un;
+  if(!u)h+='<div class="mut small" style="padding:8px 4px"><span class="spin"></span> Asking the ScoreBridge over USB…</div>';
+  else if(!u.ok)h+=`<div class="bad small" style="padding:8px 4px">${esc(u.error)}</div>`;
+  else h+=`<div style="padding:4px 14px 14px;border:1px solid var(--line);border-radius:10px;margin-top:6px"><div class="mut small" style="margin-top:8px">${bnetNow(u.network)} · Ethernet ${u.network.link?'linked':'<span class="bad">unplugged</span>'}</div>${bnetFields('wn',u.network,u.network.dhcp)}<div class="mut small" id="w_unmsg" style="margin-top:8px"></div></div>`;}
+ return h;}
+async function wUsbNetPick(){W.usbnet='net';if(!W.un||!W.un.ok){W.un=null;wRender();
+ try{W.un=await (await fetch('/api/bridge/network?via=usb&port='+encodeURIComponent(W.unport))).json();}catch(e){W.un={ok:false,error:String(e)};}}
+ if(W.step==1)wRender();}
+async function wUsbNetSave(){const v=bnetValues('wn',W.un.network.hostname);const b=$('w_unbtn'),m=$('w_unmsg');b.disabled=true;
+ m.className='mut small';m.innerHTML='<span class="spin"></span> Sending over USB…';
+ const r=await (await fetch('/api/bridge/network',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify({via:'usb',port:W.unport,...v})})).json();
+ if(!r.ok){m.className='bad small';m.textContent=r.error;b.disabled=false;return;}
+ m.innerHTML=`<span class="spin"></span> Waiting for it at ${esc(r.address)} (it restarts, about 10 s)…`;
+ const w=await (await fetch('/api/bridge/wait',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify({address:r.address})})).json();
+ if(!w.found){m.className='bad small';m.textContent=`Saved, but it didn't answer at ${r.address}. Check the Ethernet cable, or keep using USB for now.`;b.disabled=false;return;}
+ const s=await postSettings({source:'tcp','tcp.host':r.address,'tcp.port':String(r.network.tcp_port||10001)});
+ if(s.ok){await getSettings();wGo(2);}}
 function wOther(){const v=$('w_os').value;$('w_tcp').hidden=v!='tcp';$('w_ser').hidden=v!='serial';}
 async function wUse(){let ch;
  if(W.other){const v=$('w_os').value;
@@ -2328,6 +2423,58 @@ class App:
         if self.webhook and self.running:
             self.webhook.start()
             self.gen += 1  # send the current data straight away
+
+    # ---- ScoreBridge network settings (bridgecfg)
+    def bridge_target(self, q: dict) -> dict:
+        """How to reach the box: {"via": "usb", "port"} or {"via": "net", "host"}. Default = the current source."""
+        via = q.get("via") or ""
+        if not via:
+            via = "usb" if self.cfg["source"] == "serial" else "net" if self.cfg["source"] == "tcp" else ""
+        if via == "usb":
+            port = q.get("port") or (self.reader.serial_port if self.cfg["source"] == "serial" else None) \
+                or self.cfg.get("port")
+            if not port or port == "auto":
+                raise ValueError("Pick the ScoreBridge's USB port first")
+            return {"via": "usb", "port": port}
+        if via == "net":
+            host = (q.get("host") or get_path(self.cfg, "tcp.host") or "").strip()
+            if not host:
+                raise ValueError("Type the ScoreBridge's address first")
+            return {"via": "net", "host": host}
+        raise ValueError("Read a ScoreBridge over USB or the network (Scoreboard input › Source)")
+
+    def _bridge_usb(self, port: str, line: bytes) -> dict:
+        import bridgecfg
+
+        r = self.reader
+        if self.cfg["source"] == "serial" and r.is_alive() and r.serial_port == port:
+            return bridgecfg._reply(r.bridge_request(line))
+        return bridgecfg.usb_request(port, line)
+
+    def bridge_network(self, q: dict, changes: dict | None = None) -> dict:
+        """Read (changes None) or set the ScoreBridge's Ethernet settings. Never raises: {"ok": False, "error"}."""
+        import bridgecfg
+
+        try:
+            t = self.bridge_target(q)
+            net = bridgecfg.clean_network(changes) if changes is not None else None
+            if t["via"] == "usb":
+                r = self._bridge_usb(t["port"], bridgecfg.usb_line("NET" if net else "GET", net))
+            else:
+                r = bridgecfg.http_set(t["host"], net) if net else bridgecfg.http_get(t["host"])
+        except (ValueError, bridgecfg.BridgeError) as e:
+            return {"ok": False, "error": str(e)}
+        out = {"ok": True, "via": t["via"], "target": t.get("port") or t.get("host"),
+               "network": r.get("network", {}), "restarting": bool(r.get("restarting"))}
+        if net:
+            out["address"] = bridgecfg.new_address(net)
+            log(f"ScoreBridge network set over {t['via']}: " + (f"static {net['ip']}" if net["ip"] else "DHCP"))
+            # reading it over the network: follow it to its new address
+            if t["via"] == "net" and self.cfg["source"] == "tcp" and out["restarting"] \
+                    and get_path(self.cfg, "tcp.host") != out["address"]:
+                self.apply_settings({"tcp.host": out["address"]})
+                out["followed"] = out["address"]
+        return out
 
     # ---- settings
     def live_source(self) -> str:
@@ -2688,6 +2835,9 @@ class App:
                         log(f"Device search failed: {e}")
                         found = []
                     return self._send(200, json.dumps({"devices": found}, ensure_ascii=False), "application/json")
+                if u.path == "/api/bridge/network":
+                    q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                    return self._send(200, json.dumps(app.bridge_network(q)), "application/json")
                 return self._send(404, "not found", "text/plain")
 
             def do_POST(self):
@@ -2705,6 +2855,22 @@ class App:
                         return self._send(400, json.dumps({"ok": False, "errors": {"": "invalid JSON"}}),
                                           "application/json")
                     res = app.apply_settings(changes)
+                    return self._send(200 if res["ok"] else 400, json.dumps(res), "application/json")
+                if u.path in ("/api/bridge/network", "/api/bridge/wait"):
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+                        assert isinstance(body, dict)
+                    except (ValueError, UnicodeDecodeError, AssertionError):
+                        return self._send(400, json.dumps({"ok": False, "error": "invalid JSON"}), "application/json")
+                    if u.path == "/api/bridge/wait":
+                        import bridgecfg
+
+                        addr = str(body.get("address") or "")
+                        found = bool(addr) and bridgecfg.wait_for(addr, timeout=min(float(body.get("timeout") or 25), 40))
+                        return self._send(200, json.dumps({"ok": True, "found": found}), "application/json")
+                    q = {k: str(body.pop(k)) for k in ("via", "port", "host") if body.get(k)}
+                    res = app.bridge_network(q, body)
                     return self._send(200 if res["ok"] else 400, json.dumps(res), "application/json")
                 if u.path == "/api/sport":
                     name = (qs.get("name") or [""])[0]

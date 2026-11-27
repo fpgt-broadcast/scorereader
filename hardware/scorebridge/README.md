@@ -122,6 +122,7 @@ The full list is in `pcb/fab/scorebridge-bom.csv`. The parts worth choosing care
    - **Port:** `10001`.
    - Pick the scoreboard brand as usual. The CLIENT LED lights while ScoreReader is connected.
    - Over USB instead: **Source: Serial**, its COM port, **Baud: 115200**.
+   - DHCP or a static IP can also be set from ScoreReader (Settings › Scoreboard input › **ScoreBridge network**), over USB or the network, firmware 1.1+. First-run setup offers it too when the box is plugged in over USB.
 6. **Check the data:** the **Last bytes** line on the bridge's page shows the raw data. Over USB, `python scorereader.py --port COM7 --baud 115200 --sniff 20` shows the same.
    - Daktronics current loop: `55 AA` frames.
    - Electro-Mech: bytes alternating between under `80` and `80`-or-over.
