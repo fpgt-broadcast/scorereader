@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 — 2026-11-27
+- **New dashboard:** four tabs (Home, Teams, Diagnostics, Settings). Home shows where the data comes from, the game right now with that sport's own details (down & distance, shot clock, balls-strikes-outs, shots, fouls …), the vMix data-source address, and the other network outputs in a folding box.
+- **First-run setup:** a step-by-step setup opens on a new install. It searches for ScoreBridges on the network (by name, then a quick scan) and for USB devices (ScoreBot, ScoreBridge on USB, other USB-serial cables), then walks through scoreboard brand and sport, vMix and network outputs. Older installs skip it; **Settings → Run setup again** brings it back.
+- **Settings apply straight away:** MQTT and the dashboard port no longer need a ScoreReader restart. After a port change the dashboard reopens on the new port; a port that's already in use changes nothing.
+- **Webhook output:** POSTs the score as JSON to a URL of your choice whenever it changes (Settings → Network outputs).
+- **ScoreBridge network settings:** set the ScoreBridge to DHCP or a static IP from ScoreReader, over USB or the network (Settings → Scoreboard input), or put a USB-connected ScoreBridge on the network during setup. Needs ScoreBridge firmware 1.1 (not yet tested on a board).
+- **Renamed:** the "MQTT (OSE)" settings are now just "MQTT", under Network outputs.
+- **Hardware (new `hardware/` folder):** ways to read a console without a ScoreBot.
 - **Hardware (new `hardware/` folder):** ways to read a console without a ScoreBot.
   - **ScoreBridge:** a WT32-ETH01 carrier board (KiCad project, Gerbers/BOM/CPL for PCBWay, schematic). It has a current-loop input on an optocoupler, plus RS-232 and RS-485 inputs. It comes with a 3D-printed case and ESP32 firmware that streams the raw console bytes to ScoreReader's TCP source (port 10001) or over USB.
   - **Nano bridge:** an Arduino Nano sketch for current-loop consoles over USB.
