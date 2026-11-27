@@ -56,6 +56,7 @@ ScoreReader runs its own MQTT broker that looks like ScoreConnect III's, so OSE 
 - **Team names:** come from the **Teams** tab. Older configs' `mqtt.home_team_name`/`guest_team_name` still work as a fallback.
 - **Updates:** values are published on every change and at least once a second, and a new subscriber gets the latest values straight away.
 - **Existing broker:** set mode to `client` and enter the broker's host to publish into Mosquitto or similar instead.
+- **Clients can't publish on `bot/…`:** the broker acknowledges such a PUBLISH but doesn't pass it on, so nobody on the network (or a web page, over the WebSocket port) can put other scores in front of OSE. Other topics are forwarded as before.
 
 ## Webhook
 
@@ -111,6 +112,8 @@ A ScoreBridge found by mDNS is saved by its `.local` name; one found by the scan
 **ScoreBridge network (DHCP or static IP).** Needs ScoreBridge firmware 1.1 or newer. With the source set to a ScoreBridge on USB (Serial) or on the network (TCP), Settings › Scoreboard input shows a **ScoreBridge network** card: what address it has now, DHCP or Static IP, and **Send to ScoreBridge**. The box restarts (about 5 s). Over the network, ScoreReader then reads it at its new address (the static IP, or `name.local` for DHCP). In first-run setup, picking a ScoreBridge on USB offers **Put it on the network**: the address is sent over USB, ScoreReader waits for the box to answer on the network and switches to it.
 
 API: `GET /api/bridge/network[?via=usb&port=COM7 | ?via=net&host=…]`, `POST /api/bridge/network` `{"dhcp": false, "ip": "192.168.1.50", "mask": "255.255.255.0", "gateway": "192.168.1.1", "dns": "", "hostname": "scorebridge"}` (plus optional `via`/`port`/`host`; default = the current source), `POST /api/bridge/wait` `{"address": "…"}`. On the box: `GET/POST /api/network` (form fields `host ip mask gw dns`, blank ip = DHCP); on USB one line `@SB GET` or `@SB NET host=… ip=… mask=… gw=… dns=…`, answered with JSON between `\r\n@SB>` and `<@SB\r\n`. A settings password on the box blocks changes over the network (change them on its own page).
+
+**Who can use the dashboard.** It has no login: anyone on the network can open it, so keep ScoreReader on the production network. Two things keep *web pages* out: every POST, and the two GETs that act (`/api/discover`, `/api/bridge/network`), need the header `X-ScoreReader: 1`, which another site's page can't send; and requests whose `Host` isn't an IP, `localhost`, a plain computer name or a `.local` name get 421, so a page can't point its own domain at this computer (DNS rebinding). If you open the dashboard by a real DNS name, add it with `SCOREREADER_ALLOWED_HOSTS=scores.example.org` (comma-separated).
 
 ## Scoreboard brands
 

@@ -111,10 +111,11 @@ The full list is in `pcb/fab/scorebridge-bom.csv`. The parts worth choosing care
    - PlatformIO: `cd firmware && pio run -t upload`.
    - Arduino IDE: install the "esp32" boards, open `firmware/ScoreBridge/ScoreBridge.ino`, choose "ESP32 Dev Module" and upload.
    - If the upload doesn't start, hold **BOOT**, tap **RESET** and release BOOT.
-   - Later updates can go over the network: the settings page → **Firmware update**, upload the `.bin`.
+   - Later updates can go over the network once a **settings password** is set (then restart the box): the settings page → **Firmware update**, upload the `.bin`. Without a password the box refuses network updates, so nobody else on the network (or on its setup access point) can load their own firmware.
 3. **Connect to its settings page:**
    - **On Ethernet:** plug in a cable. The NET LED goes solid once it has an address. Open `http://scorebridge.local/`, or look up its IP in your router's DHCP list.
    - **No network:** after 15 seconds it starts its own Wi-Fi network, **ScoreBridge-XXXX**, password `scorebridge`; the NET LED blinks. Join it and open `http://192.168.4.1/`.
+   - **Then set a settings password and your own access point password** on that page. Until you do, anyone on the network, or anyone in the building who joins `ScoreBridge-XXXX` with the published default password, can change its settings.
 4. **Pick the console:** click a preset on the settings page (Daktronics current loop, Electro-Mech current loop, Colorado Timing V1/V2, Daktronics RTD), then **Save**. The settings page shows bytes arriving, live.
 5. **Set up ScoreReader:**
    - Settings → **Source: TCP**.

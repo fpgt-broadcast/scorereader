@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.0 — 2026-11-27
+- **Security:** the dashboard only answers to an IP address, `localhost`, a plain computer name or a `.local` name (others get 421), so a web page can't reach it by pointing its own domain at your network. Add other names with `SCOREREADER_ALLOWED_HOSTS`.
+- **Security:** device search and ScoreBridge network settings can only be started from ScoreReader's own dashboard, not by another website open in the same browser. ScoreBridge addresses are checked before use.
+- **Security:** MQTT clients can no longer publish fake scoreboard data on the `bot/…` topics; only ScoreReader writes them.
+- **ScoreBridge firmware 1.1.1** (needs compiling before flashing): settings changes from other websites are refused, and wireless updates (OTA) only work once a settings password is set.
+
 ## 2.2.0 — 2026-11-27
 - **New dashboard:** four tabs (Home, Teams, Diagnostics, Settings). Home shows where the data comes from, the game right now with that sport's own details (down & distance, shot clock, balls-strikes-outs, shots, fouls …), the vMix data-source address, and the other network outputs in a folding box.
 - **First-run setup:** a step-by-step setup opens on a new install. It searches for ScoreBridges on the network (by name, then a quick scan) and for USB devices (ScoreBot, ScoreBridge on USB, other USB-serial cables), then walks through scoreboard brand and sport, vMix and network outputs. Older installs skip it; **Settings → Run setup again** brings it back.

@@ -32,6 +32,7 @@ import json
 import os
 import queue
 import random
+import re
 import signal
 import socket
 import sys
@@ -42,7 +43,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape as xml_escape
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)  # PyInstaller support
@@ -1602,6 +1603,40 @@ def flatten(d: dict) -> dict:
     return {k: (("1" if v else "0") if isinstance(v, bool) else v) for k, v in d.items()}
 
 
+_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain", ".localhost", ".home.arpa")
+
+
+def host_name(host_header: str) -> str:
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):
+        h = h[1:h.index("]")] if "]" in h else h[1:]
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+    return h.rstrip(".")
+
+
+def host_allowed(host_header) -> bool:
+    """The Host header names this computer the way a LAN visitor would: an IP, localhost, a plain computer name or a
+    .local name. Anything else is a web page that pointed its own domain at us (DNS rebinding) and is refused, so it
+    can't change settings through the operator's browser. SCOREREADER_ALLOWED_HOSTS (comma-separated) adds names."""
+    if not host_header:
+        return True  # HTTP/1.0 tools send none
+    h = host_name(host_header)
+    if not h:
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    if h == "localhost" or "." not in h or h.endswith(_LAN_SUFFIXES) or h == socket.gethostname().lower():
+        return True
+    extra = [host_name(x) for x in os.environ.get("SCOREREADER_ALLOWED_HOSTS", "").split(",") if x.strip()]
+    return h in extra
+
+
 _LAN_IP = [0.0, None]
 
 
@@ -2054,7 +2089,7 @@ function bnetNow(n){return n.current_ip?`Now on the network as <b style="color:v
 async function bnetLoad(){const f=$('bnet');if(!f)return;const src=S.values.source;
  if(src!='serial'&&src!='tcp'){f.hidden=true;return;}
  f.hidden=false;$('bnetbody').innerHTML='<div class="mut" style="padding:8px 0"><span class="spin"></span> Asking the ScoreBridge…</div>';
- let r;try{r=await (await fetch('/api/bridge/network')).json();}catch(e){r={ok:false,error:String(e)};}
+ let r;try{r=await (await fetch('/api/bridge/network',{headers:H})).json();}catch(e){r={ok:false,error:String(e)};}
  if(!r.ok){$('bnetbody').innerHTML=`<div class="mut small" style="padding:6px 0">No ScoreBridge settings here: ${esc(r.error)}. <a href="#" onclick="bnetLoad();return false">Try again</a></div>`;return;}
  BN={via:r.via,target:r.target,net:r.network};const n=r.network;
  $('bnetbody').innerHTML=`<div class="bnhead"><div class="mut small">${bnetNow(n)} · Ethernet ${n.link?'linked':'unplugged'} · name ${esc(n.hostname)}</div><span class="badge">${r.via=='usb'?'talking over USB · ':'over the network · '}${esc(r.target)}</span></div>
@@ -2085,7 +2120,7 @@ async function finishWizard(skip){await postSettings({setup_done:true});$('wiz')
 function wGo(n){W.step=n;wRender();}
 function wSteps(){$('wsteps').innerHTML=WSTEPS.map((t,i)=>`<div class="st ${i+1<W.step?'done':i+1==W.step?'on':''}"><b>${i+1<W.step?'✓':i+1}</b>${t}</div>`).join('');}
 async function wSearch(){W.devs=null;W.sel=null;wRender();
- try{W.devs=(await (await fetch('/api/discover')).json()).devices;}catch(e){W.devs=[];}
+ try{W.devs=(await (await fetch('/api/discover',{headers:H})).json()).devices;}catch(e){W.devs=[];}
  if(W.devs.length&&W.sel==null)W.sel=0;if(W.step==1)wRender();}
 const ICON={scorebridge:'⇄',scorebridge_usb:'⌁',scorelink:'⌁',serial:'⌁'};
 function wRender(){wSteps();const b=$('wbody');const s=W.step;
@@ -2146,7 +2181,7 @@ function wUsbNet(dev){const port=dev.settings.port;
   else h+=`<div style="padding:4px 14px 14px;border:1px solid var(--line);border-radius:10px;margin-top:6px"><div class="mut small" style="margin-top:8px">${bnetNow(u.network)} · Ethernet ${u.network.link?'linked':'<span class="bad">unplugged</span>'}</div>${bnetFields('wn',u.network,u.network.dhcp)}<div class="mut small" id="w_unmsg" style="margin-top:8px"></div></div>`;}
  return h;}
 async function wUsbNetPick(){W.usbnet='net';if(!W.un||!W.un.ok){W.un=null;wRender();
- try{W.un=await (await fetch('/api/bridge/network?via=usb&port='+encodeURIComponent(W.unport))).json();}catch(e){W.un={ok:false,error:String(e)};}}
+ try{W.un=await (await fetch('/api/bridge/network?via=usb&port='+encodeURIComponent(W.unport),{headers:H})).json();}catch(e){W.un={ok:false,error:String(e)};}}
  if(W.step==1)wRender();}
 async function wUsbNetSave(){const v=bnetValues('wn',W.un.network.hostname);const b=$('w_unbtn'),m=$('w_unmsg');b.disabled=true;
  m.className='mut small';m.innerHTML='<span class="spin"></span> Sending over USB…';
@@ -2440,6 +2475,8 @@ class App:
             host = (q.get("host") or get_path(self.cfg, "tcp.host") or "").strip()
             if not host:
                 raise ValueError("Type the ScoreBridge's address first")
+            if not re.fullmatch(r"[A-Za-z0-9.\-]{1,253}(:\d{1,5})?|\[[0-9A-Fa-f:.]+\](:\d{1,5})?", host):
+                raise ValueError("That isn't a ScoreBridge address: an IP or a name like scorebridge.local")
             return {"via": "net", "host": host}
         raise ValueError("Read a ScoreBridge over USB or the network (Scoreboard input › Source)")
 
@@ -2791,8 +2828,21 @@ class App:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _host_ok(self) -> bool:
+                if host_allowed(self.headers.get("Host")):
+                    return True
+                self._send(421, f"ScoreReader doesn't answer to the name {host_name(self.headers.get('Host'))!r}. Use "
+                                "this computer's IP address, or add the name to SCOREREADER_ALLOWED_HOSTS.", "text/plain")
+                return False
+
             def do_GET(self):
+                if not self._host_ok():
+                    return
                 u = urllib.parse.urlparse(self.path)
+                # These two act (a network scan; opening a serial port or reaching another host), so like the POSTs
+                # they need the dashboard's header: a link or <img> on another site can't trigger them.
+                if u.path in ("/api/discover", "/api/bridge/network") and self.headers.get("X-ScoreReader") != "1":
+                    return self._send(403, "missing X-ScoreReader: 1 header", "text/plain")
                 d = app.public(app.current())  # only the fields used in the sport (unless output_all_fields)
                 flat = flatten(d)
                 if u.path in ("/data.json", "/data.obj.json", "/data.xml", "/data.csv"):
@@ -2841,6 +2891,8 @@ class App:
                 return self._send(404, "not found", "text/plain")
 
             def do_POST(self):
+                if not self._host_ok():
+                    return
                 u = urllib.parse.urlparse(self.path)
                 qs = urllib.parse.parse_qs(u.query)
                 # The custom header makes browsers send a CORS preflight for cross-site requests, which this

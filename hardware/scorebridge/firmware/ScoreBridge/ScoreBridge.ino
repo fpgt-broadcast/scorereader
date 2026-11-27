@@ -17,7 +17,7 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 
 // ---------------------------------------------------------------- hardware
 static const int PIN_IN_CL = 35;
@@ -379,6 +379,29 @@ bool authorised() {
   return false;
 }
 
+// The browser must be talking to this box by its own address: an IP, a plain name or a .local name. A web page that
+// points its own domain at the box (DNS rebinding) sends that domain as Host and is refused.
+bool hostOk() {
+  String h = web.hostHeader();
+  int c = h.indexOf(':');
+  if (c >= 0) h = h.substring(0, c);
+  h.toLowerCase();
+  if (!h.length()) return true;  // HTTP/1.0 tools
+  if (h.indexOf('.') < 0 || h.endsWith(".local")) return true;
+  for (char ch : h) if (!(isdigit((unsigned char)ch) || ch == '.')) return false;
+  return true;  // an IPv4 address
+}
+
+// For anything that changes the box: a form or fetch on another site's page (CSRF) carries that site's Origin, and
+// would otherwise work with no password, or with the password the browser remembers. ScoreReader and curl send none.
+bool allowedChange() {
+  if (!hostOk() || (web.hasHeader("Origin") && web.header("Origin") != String("http://") + web.hostHeader())) {
+    web.send(403, "text/plain", "Refused: changes must come from this ScoreBridge's own page or from ScoreReader");
+    return false;
+  }
+  return authorised();
+}
+
 String esc(const String &s) {
   String o;
   for (char c : s) {
@@ -513,7 +536,7 @@ void applySerialArgs() {
 }
 
 void handleSave() {
-  if (!authorised()) return;
+  if (!allowedChange()) return;
   String oldNet = cfg.hostname + cfg.tcpPort + cfg.ip + cfg.mask + cfg.gateway + cfg.dns + cfg.ssid;
   applySerialArgs();
   cfg.invert = web.hasArg("invert");
@@ -537,7 +560,7 @@ void handleSave() {
 // POST /api/serial?input=cl|rs232|rs485&baud=19200&invert=1&format=8N1[&save=1] (for ScoreReader to set the
 // input for the chosen scoreboard; without save=1 the change lasts until the next restart)
 void handleApiSerial() {
-  if (!authorised()) return;
+  if (!allowedChange()) return;
   applySerialArgs();
   if (web.hasArg("invert")) cfg.invert = web.arg("invert") == "1" || web.arg("invert") == "true";
   if (web.arg("save") == "1") saveSettings();
@@ -553,7 +576,7 @@ void handleApiNetwork() {
     web.send(200, "application/json", netJson());
     return;
   }
-  if (!authorised()) return;
+  if (!allowedChange()) return;
   bool changed = false;
   String err = applyNetwork(web.arg("host"), web.arg("ip"), web.arg("mask"), web.arg("gw"), web.arg("dns"), &changed);
   if (err.length()) {
@@ -571,8 +594,16 @@ void startWeb() {
   web.on("/api/status", HTTP_GET, [] { web.sendHeader("Access-Control-Allow-Origin", "*"); web.send(200, "application/json", statusJson()); });
   web.on("/api/serial", HTTP_POST, handleApiSerial);
   web.on("/api/network", HTTP_ANY, handleApiNetwork);
-  web.on("/reboot", HTTP_POST, [] { if (!authorised()) return; web.send(200, "text/plain", "Restarting"); delay(300); ESP.restart(); });
-  updater.setup(&web, "/update", "admin", cfg.adminPass.length() ? cfg.adminPass.c_str() : "");
+  web.on("/reboot", HTTP_POST, [] { if (!allowedChange()) return; web.send(200, "text/plain", "Restarting"); delay(300); ESP.restart(); });
+  // Firmware over the network only with a settings password: without one, anyone on the network (or on the setup
+  // access point, whose default password is public) could load their own firmware. USB flashing always works.
+  if (cfg.adminPass.length()) updater.setup(&web, "/update", "admin", cfg.adminPass.c_str());
+  else web.on("/update", HTTP_ANY, [] {
+    web.send(403, "text/plain", "Set a settings password on the main page and restart the ScoreBridge to update its "
+                                "firmware over the network. Over USB always works.");
+  });
+  static const char *headerKeys[] = {"Origin"};
+  web.collectHeaders(headerKeys, 1);
   web.onNotFound([] { web.send(404, "text/plain", "Not found"); });
   web.begin();
 }

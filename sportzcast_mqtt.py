@@ -532,7 +532,10 @@ class MiniBroker:
                         i += 2
                     if c.level >= 5:
                         i = self._skip_props(body, i)
-                    self._publish(topic, body[i:], bool(h & 1))
+                    # bot/... is ScoreReader's own data: a client (or any web page, over the WebSocket port) must
+                    # not be able to put other scores there for OSE and the graphics. Acknowledged, not forwarded.
+                    if not topic.startswith("bot/"):
+                        self._publish(topic, body[i:], bool(h & 1))
                     if qos == 1:
                         s.write(b"\x40\x02" + pid)
                     elif qos == 2:
