@@ -183,7 +183,7 @@ Command-line options apply to that session only and are never saved.
 
 ## Settings file
 
-Settings are stored in `scorereader_config.json` next to the program (on the Mac app, in `~/Library/Application Support/ScoreReader`), which is created on first run. The dashboard's Settings tab edits it for you; demo and replay are never saved, so ScoreReader always starts on live data. Raw bytes are logged to `logs/raw_*.bin` unless you turn that off.
+Settings are stored in `scorereader_config.json` next to the program (on the Mac app, in `~/Library/Application Support/ScoreReader`), which is created on first run. The dashboard's Settings tab edits it for you; demo and replay are never saved, so ScoreReader always starts on live data. Every change applies as soon as you save, MQTT and the dashboard port included (after a port change the dashboard reopens on the new port; update the vMix data source URL to match). If the new dashboard port is already in use, nothing changes. Raw bytes are logged to `logs/raw_*.bin` unless you turn that off.
 
 ## Development
 

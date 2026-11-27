@@ -68,7 +68,7 @@ def test_setting_types_and_restart_flags(paths):
     app = make_app()
     res = app.apply_settings({"mqtt.bot_number": "175", "teams.home_color": "#1e3a8a", "record_raw": "false",
                               "http_port": 9000})
-    assert res["ok"] and res["restart_needed"] == ["http_port"]
+    assert res["ok"] and res["restart_needed"] == [] and "moved_to_port" not in res  # not running: just saved
     assert app.cfg["mqtt"]["bot_number"] == 175 and app.cfg["teams"]["home_color"] == "#1E3A8A"
     assert app.cfg["record_raw"] is False
 

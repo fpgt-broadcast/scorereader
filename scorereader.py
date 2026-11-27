@@ -250,20 +250,20 @@ SETTINGS = {
     "vmix.host": ("vMix", "vMix host", "str", "vmix"),
     "vmix.port": ("vMix", "vMix TCP port", "port", "vmix"),
     "vmix.input": ("vMix", "Title input name or number", "str", "vmix"),
-    "mqtt.enabled": ("MQTT", "MQTT output", "bool", "restart"),
+    "mqtt.enabled": ("MQTT", "MQTT output", "bool", "mqtt"),
     "mqtt.bot_number": ("MQTT", "Bot number (topics bot/N/…)", "int", "live"),
-    "mqtt.mode": ("MQTT", "Mode", "choice", "restart"),
-    "mqtt.tcp_port": ("MQTT", "Broker TCP port", "port", "restart"),
-    "mqtt.ws_port": ("MQTT", "Broker WebSocket port", "port", "restart"),
-    "mqtt.broker_host": ("MQTT", "External broker host (client mode)", "str", "restart"),
-    "mqtt.broker_port": ("MQTT", "External broker port (client mode)", "port", "restart"),
+    "mqtt.mode": ("MQTT", "Mode", "choice", "mqtt"),
+    "mqtt.tcp_port": ("MQTT", "Broker TCP port", "port", "mqtt"),
+    "mqtt.ws_port": ("MQTT", "Broker WebSocket port", "port", "mqtt"),
+    "mqtt.broker_host": ("MQTT", "External broker host (client mode)", "str", "mqtt"),
+    "mqtt.broker_port": ("MQTT", "External broker port (client mode)", "port", "mqtt"),
     "webhook.enabled": ("Webhook", "POST the data to a URL on every change", "bool", "webhook"),
     "webhook.url": ("Webhook", "Webhook URL", "url", "webhook"),
     "webhook.min_interval_ms": ("Webhook", "At most one POST every (ms)", "int", "live"),
     "text_files.enabled": ("Files", "Write one .txt file per field", "bool", "live"),
     "record_raw": ("Files", "Record raw bytes to logs/", "bool", "live"),
     "save_state": ("Files", "Remember board values after a restart (RTD only)", "bool", "live"),
-    "http_port": ("Advanced", "Dashboard / data.json port", "port", "restart"),
+    "http_port": ("Advanced", "Dashboard / data.json port", "port", "http"),
     "output_all_fields": ("Advanced", "Include every raw field in data.json / XML / CSV", "bool", "live"),
     "setup_done": ("Advanced", "First-run setup finished", "bool", "live"),
 }
@@ -1819,7 +1819,9 @@ const truthy=v=>v===true||v==='1'||v===1||v==='true';
 let ST=null,S=null,TAB='home';
 function toast(t){const e=$('toast');e.textContent=t;e.hidden=false;clearTimeout(e._t);e._t=setTimeout(()=>e.hidden=true,2200);}
 function copyText(t){(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast('Copied'),()=>{const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();try{document.execCommand('copy');toast('Copied')}catch(e){}a.remove();});}
-async function postSettings(ch){const r=await fetch('/api/settings',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(ch)});const j=await r.json();if(!j.ok)toast(Object.values(j.errors||{}).join(' · ')||'Not saved');S=null;return j;}
+async function postSettings(ch){const r=await fetch('/api/settings',{method:'POST',headers:{...H,'Content-Type':'application/json'},body:JSON.stringify(ch)});const j=await r.json();if(!j.ok)toast(Object.values(j.errors||{}).join(' · ')||'Not saved');S=null;
+ if(j.moved_to_port){const u=location.protocol+'//'+location.hostname+':'+j.moved_to_port+location.pathname+location.hash;toast('Dashboard moved to port '+j.moved_to_port+'. Opening it…');setTimeout(()=>location.href=u,1200);}
+ return j;}
 async function getSettings(){S=await (await fetch('/api/settings')).json();return S;}
 async function reinit(){await fetch('/api/reinit',{method:'POST',headers:H});toast('Re-init requested');}
 async function goLive(){await postSettings({source:ST&&ST.live_source||'scorelink'});}
@@ -1882,7 +1884,7 @@ function renderHome(s){
  // network outputs
  const m=o.mqtt;const mqc=!m.enabled?'':m.state.startsWith('error')?'r':(m.state.startsWith('listening')||m.state.startsWith('connected'))?'g':'y';
  setDot('mqdot',mqc);
- $('mqstate').textContent=!m.enabled?(m.configured?'on after a restart':'off'):(m.clients+' client'+(m.clients==1?'':'s'));
+ $('mqstate').textContent=!m.enabled?(m.configured?'off for this run (--no-mqtt)':'off'):(m.clients+' client'+(m.clients==1?'':'s'));
  $('mqcopyrow').hidden=!m.enabled;
  $('mqaddr').textContent=m.mode=='client'?`→ ${m.broker_host}:${m.broker_port} · bot ${m.bot}`:`${o.lan_ip}:${m.tcp_port}${m.ws_port?' · ws :'+m.ws_port:''} · bot ${m.bot}`;
  const ja=Math.min(o.json.age??1e9,o.json_obj.age??1e9);const jage=ja==1e9?null:ja;
@@ -2004,7 +2006,7 @@ async function saveSettings(){const ch={};
  const r=await postSettings(ch);
  if(!r.ok){$('setmsg').className='bad';$('setmsg').textContent=Object.values(r.errors).join(' · ');return;}
  await getSettings();renderSettings();
- $('setmsg').className='ok';$('setmsg').textContent='Saved.'+(r.restart_needed.length?' Restart ScoreReader to apply: '+r.restart_needed.join(', '):'');}
+ $('setmsg').className='ok';$('setmsg').textContent='Saved and applied.'+(r.moved_to_port?' Moving to port '+r.moved_to_port+'… (update vMix data sources to the new port)':'');}
 
 /* ---------- setup wizard ---------- */
 const WSTEPS=['Connect','Scoreboard','vMix','Network outputs','Done'];let W={step:1,devs:null,sel:null,other:false};
@@ -2094,7 +2096,7 @@ async function wSaveVmix(){const on=$('w_stsw').classList.contains('on');const c
 async function wSaveNet(){const m=$('w_mq').classList.contains('on'),wh=$('w_wh').classList.contains('on');
  const ch={'mqtt.enabled':m,'webhook.enabled':wh};if(m)ch['mqtt.bot_number']=$('w_bot').value.trim();if(wh)ch['webhook.url']=$('w_whurl').value.trim();
  if(wh&&!ch['webhook.url']){toast('Type the webhook URL, or turn it off');return;}
- const r=await postSettings(ch);if(r.ok){await getSettings();W.restart=r.restart_needed.length>0;wGo(5);}}
+ const r=await postSettings(ch);if(r.ok){await getSettings();wGo(5);}}
 function wLive(){if($('wiz').hidden||!ST)return;const d=ST.data,s=ST;
  const l=$('w_live');if(l)l.innerHTML=`<span>${esc(abbr(d,'home'))} ${esc(d.home_score??0)}</span><span>${esc(d.clock||'--:--')} · ${esc(d.period_ordinal||'')}</span><span>${esc(abbr(d,'guest'))} ${esc(d.guest_score??0)}</span><span class="small ${s.packet_age!=null&&s.packet_age<10?'ok':'mut'}" style="font-family:system-ui">${s.packet_age==null?'no data yet':s.packet_age<10?'● live':'last data '+Math.round(s.packet_age)+' s ago'}</span>`;
  const x=$('w_xml');if(x){const a=s.outputs.xml.age;x.innerHTML=a!=null&&a<30?'<span class="ok">✓ vMix (or something) is reading it</span>':'Waiting for vMix to read it…';}
@@ -2102,7 +2104,7 @@ function wLive(){if($('wiz').hidden||!ST)return;const d=ST.data,s=ST;
  const sm=$('w_sum');if(sm){const o=s.outputs,live=s.packet_age!=null&&s.packet_age<10;
   const it=[[live,'Scoreboard data',inputTitle(s)],[o.xml.age!=null,'vMix reading data.xml',o.xml.age!=null?ageTxt(o.xml.age):'not yet: add the Data Source in vMix'],
    [!o.vmix.enabled||o.vmix.state.startsWith('connected'),'vMix SetText push',o.vmix.enabled?o.vmix.state:'off'],
-   [true,'MQTT',o.mqtt.enabled?o.mqtt.clients+' client(s)':o.mqtt.configured?'starts after a restart of ScoreReader':'off'],
+   [true,'MQTT',o.mqtt.enabled?o.mqtt.clients+' client(s)':o.mqtt.configured?'off for this run (--no-mqtt)':'off'],
    [!o.webhook.enabled||o.webhook.state.startsWith('ok'),'Webhook',o.webhook.enabled?o.webhook.state:'off']];
   sm.innerHTML=it.map(([ok,t,d])=>`<div class="row"><span>${ok?'<span class="ok">✓</span>':'<span style="color:var(--warn)">!</span>'} &nbsp;${esc(t)}</span><span class="mut small">${esc(d)}</span></div>`).join('');}}
 
@@ -2140,11 +2142,7 @@ class App:
             log(f"Unknown sport '{cfg['sport']}', using football. Options: {', '.join(self.sports.names())}")
             cfg["sport"] = "football"
         self.decoder, self.cl = self._new_decoders()
-        self.mqtt = None
-        if cfg.get("mqtt", {}).get("enabled"):
-            from sportzcast_mqtt import SportzcastMqttOutput
-
-            self.mqtt = SportzcastMqttOutput(cfg, log=log)
+        self.mqtt = self._new_mqtt()
         self.reader = self._new_reader()
         self.vmix = VmixPusher(cfg, threading.Event()) if cfg["vmix"].get("enabled") else None
         self.webhook = self._new_webhook()
@@ -2276,6 +2274,47 @@ class App:
         else:
             STATUS.vmix_state = "disabled"
 
+    def _new_mqtt(self):
+        if not self.cfg.get("mqtt", {}).get("enabled"):
+            return None
+        from sportzcast_mqtt import SportzcastMqttOutput
+
+        return SportzcastMqttOutput(self.cfg, log=log)
+
+    def restart_mqtt(self):
+        """Apply MQTT settings in place: close the old broker/client (frees its ports), start the new one."""
+        old = self.mqtt
+        self.mqtt = None
+        self.reader.raw_hook = None
+        if old:
+            try:
+                old.stop()
+            except Exception as e:
+                log(f"MQTT: error while stopping: {e}")
+        self.mqtt = self._new_mqtt()
+        if self.mqtt:
+            if self.running:
+                self.mqtt.start()
+            self.reader.raw_hook = self.mqtt.raw
+            log("MQTT restarted with the new settings")
+        else:
+            log("MQTT output off")
+
+    def _bind_http(self, port: int):
+        return ThreadingHTTPServer(("0.0.0.0", port), self.make_handler())
+
+    def restart_http(self, new_srv):
+        """Serve on the new port now; the old server closes a moment later, after this reply has gone out."""
+        old = getattr(self, "_srv", None)
+        self._srv = new_srv
+        threading.Thread(target=new_srv.serve_forever, daemon=True).start()
+        log(f"Dashboard moved to http://localhost:{new_srv.server_address[1]}/")
+        if old is not None:
+            def close_old():
+                old.shutdown()
+                old.server_close()
+            threading.Timer(1.5, close_old).start()
+
     def _new_webhook(self):
         if get_path(self.cfg, "webhook.enabled") and get_path(self.cfg, "webhook.url"):
             return WebhookPusher(self.cfg, threading.Event())
@@ -2362,6 +2401,13 @@ class App:
             return {"ok": False, "errors": errors}
         with self.settings_lock:
             changed = {p: v for p, v in clean.items() if get_path(self.cfg, p) != v}
+            new_srv = None
+            if "http_port" in changed and self.running:
+                # bind the new port before anything changes, so a port in use leaves everything as it was
+                try:
+                    new_srv = self._bind_http(int(changed["http_port"]))
+                except OSError as e:
+                    return {"ok": False, "errors": {"http_port": f"port {changed['http_port']} can't be used: {e}"}}
             persist = False
             for path, value in changed.items():
                 set_path(self.cfg, path, value)
@@ -2380,9 +2426,16 @@ class App:
                 self.restart_vmix()
             if "webhook" in kinds:
                 self.restart_webhook()
+            if "mqtt" in kinds:
+                self.restart_mqtt()
+            if new_srv is not None:
+                self.restart_http(new_srv)
             self.gen += 1
-        return {"ok": True, "changed": sorted(changed),
-                "restart_needed": sorted(p for p in changed if SETTINGS[p][3] == "restart")}
+        res = {"ok": True, "changed": sorted(changed),
+               "restart_needed": sorted(p for p in changed if SETTINGS[p][3] == "restart")}
+        if new_srv is not None:
+            res["moved_to_port"] = new_srv.server_address[1]
+        return res
 
     # ---- data
     def current(self) -> dict:
@@ -2700,7 +2753,7 @@ class App:
             self.webhook.start()
         threading.Thread(target=self.update_loop, daemon=True).start()
         port = int(self.cfg["http_port"])
-        srv = ThreadingHTTPServer(("0.0.0.0", port), self.make_handler())
+        srv = self._bind_http(port)
         self._srv = srv
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         log(f"Dashboard:        http://localhost:{port}/")
