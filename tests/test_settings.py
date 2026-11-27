@@ -144,6 +144,12 @@ def test_settings_http_api(paths):
         with pytest.raises(urllib.error.HTTPError) as e:
             post({"baud": "fast"})
         assert e.value.code == 400
+        # DNS rebinding: a page on evil.com pointed at this computer sends its own name as Host
+        req = urllib.request.Request(base + "/api/settings", data=b'{"teams.home_name": "PWNED"}', method="POST",
+                                     headers={"Host": "rebind.evil.com", "X-ScoreReader": "1"})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        assert e.value.code == 421 and app.cfg["teams"]["home_name"] == "EAGLES"
     finally:
         srv.shutdown()
 
@@ -188,3 +194,10 @@ def test_data_xml_is_short(paths):
         assert "<home_shots" in xml and "<main_clock_time" not in xml and xml.count("<") < 70
     finally:
         srv.shutdown()
+
+
+def test_host_header_check_blocks_dns_rebinding():
+    for h in ("localhost:8765", "127.0.0.1:8765", "192.168.50.21:8765", "[::1]:8765", "nuc:8765", "nuc.local:8765", None):
+        assert sr.host_allowed(h), h
+    for h in ("evil.com", "evil.com:8765", "rebind.attacker.net:8765"):
+        assert not sr.host_allowed(h), h

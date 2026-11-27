@@ -104,3 +104,39 @@ def test_broker_websocket_with_paho():
     ("#", "$SYS/x", False), ("bot/+", "bot/1/json", False)])
 def test_topic_match(filt, topic, ok):
     assert sm._topic_match(filt, topic) is ok
+
+
+def test_broker_ignores_client_publishes_to_bot_topics():
+    """Anyone on the network (or a web page, over the WebSocket port) must not be able to put fake scores on bot/…."""
+    port = _free_port()
+    b = sm.MiniBroker("127.0.0.1", port, 0, log=lambda *_: None)
+    b.start()
+    for _ in range(50):
+        if b.status.startswith("listening"):
+            break
+        time.sleep(0.05)
+    b.publish("bot/0/json", '{"Clock":"1:00"}')
+
+    def connect(cid):
+        c = socket.create_connection(("127.0.0.1", port), timeout=3)
+        vh = _mqtt_str("MQTT") + b"\x04\x02\x00\x3c"
+        pl = _mqtt_str(cid)
+        c.sendall(b"\x10" + bytes([len(vh) + len(pl)]) + vh + pl)
+        assert c.recv(4) == b"\x20\x02\x00\x00"
+        return c
+
+    sub = connect("watcher")
+    s = b"\x00\x01" + _mqtt_str("#") + b"\x00"
+    sub.sendall(b"\x82" + bytes([len(s)]) + s)
+    assert sub.recv(5) == b"\x90\x03\x00\x01\x00"
+    assert b'"Clock":"1:00"' in sub.recv(256)  # the retained message
+    pub = connect("attacker")
+    for topic, payload in (("bot/0/json", b'{"Clock":"9:99","HomeScore":"99"}'), ("other/topic", b"hello")):
+        body = _mqtt_str(topic) + payload
+        pub.sendall(b"\x31" + bytes([len(body)]) + body)  # retained PUBLISH, QoS 0
+    sub.settimeout(1)
+    got = sub.recv(256)
+    assert b"other/topic" in got and b"9:99" not in got
+    assert "9:99" not in str(b.retained.get("bot/0/json"))
+    pub.close()
+    sub.close()

@@ -2,6 +2,7 @@
 import json
 import threading
 import urllib.parse
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -214,7 +215,13 @@ def test_http_routes(paths, http_box):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
-        assert json.load(urllib.request.urlopen(base + "/api/bridge/network"))["ok"]
+        get = urllib.request.Request(base + "/api/bridge/network", headers={"X-ScoreReader": "1"})
+        assert json.load(urllib.request.urlopen(get))["ok"]
+        try:  # without the dashboard's header (a link on another site) it does nothing
+            urllib.request.urlopen(base + "/api/bridge/network")
+            raise AssertionError("expected 403")
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
         req = urllib.request.Request(base + "/api/bridge/network", method="POST",
                                      data=json.dumps({"dhcp": True, "hostname": "gym"}).encode(),
                                      headers={"X-ScoreReader": "1", "Content-Type": "application/json"})
